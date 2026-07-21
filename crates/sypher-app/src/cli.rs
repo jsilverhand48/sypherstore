@@ -67,6 +67,10 @@ pub enum Command {
     #[command(subcommand)]
     Restore(RestoreCommand),
 
+    /// Export or use the vault's recovery key.
+    #[command(subcommand)]
+    Recovery(RecoveryCommand),
+
     /// Development and debugging helpers.
     #[command(subcommand)]
     Dev(DevCommand),
@@ -128,6 +132,36 @@ pub struct DeleteArgs {
     /// Skip the confirmation prompt.
     #[arg(long, short)]
     pub force: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RecoveryCommand {
+    /// Print the recovery key so it can be written down and stored offline.
+    ///
+    /// The recovery key removes this vault's binding to this machine. It does
+    /// NOT remove the requirement for your authenticator: reading a secret
+    /// still needs a touch. Store it apart from your YubiKey.
+    Export {
+        /// Write to this file (mode 0600) instead of the terminal.
+        ///
+        /// Preferred when the terminal is logged or recorded, since printed
+        /// output survives in scrollback.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Skip the confirmation prompt.
+        #[arg(long, short)]
+        force: bool,
+    },
+
+    /// Re-seal an existing vault's key to this machine's TPM.
+    ///
+    /// Run on a new machine after copying the vault directory across. You
+    /// will be asked for the recovery key.
+    Adopt {
+        /// Skip the confirmation prompt.
+        #[arg(long, short)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

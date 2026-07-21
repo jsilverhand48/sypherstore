@@ -420,6 +420,65 @@ mod tests {
 
         #[test]
         #[ignore = "needs a real TPM at /dev/tpmrm0"]
+        fn a_recovery_key_re_seals_the_same_vault() {
+            // The disaster-recovery path, end to end: seal a key, render it as
+            // a recovery string, destroy the seal as a dead TPM would, then
+            // adopt it back and confirm the original key returns.
+            //
+            // Written as one test on purpose. Splitting it across steps that
+            // pass a key between them is how a vault gets destroyed by a
+            // half-finished procedure.
+            use sypher_core::vault::recovery;
+
+            let tmp = tempfile::tempdir().unwrap();
+            let paths = VaultPaths::at(tmp.path().join("vault"));
+            paths.ensure_dirs().unwrap();
+            let provider = TpmOuterProvider::new(&paths);
+
+            let original = provider.provision().unwrap();
+            let written_down = recovery::encode(&original);
+
+            // The TPM is cleared / the machine is replaced.
+            std::fs::remove_file(paths.tpm_sealed_pub()).unwrap();
+            std::fs::remove_file(paths.tpm_sealed_priv()).unwrap();
+            assert!(!provider.is_provisioned());
+            assert!(matches!(
+                provider.unseal(),
+                Err(ProviderError::NotProvisioned)
+            ));
+
+            // Recovery on the replacement machine.
+            let recovered = recovery::decode(&written_down).unwrap();
+            provider.provision_with(&recovered).unwrap();
+
+            assert_eq!(
+                provider.unseal().unwrap(),
+                original,
+                "the adopted vault must yield the original outer key"
+            );
+        }
+
+        #[test]
+        #[ignore = "needs a real TPM at /dev/tpmrm0"]
+        fn a_recovery_key_from_another_vault_does_not_match() {
+            // Adopting the wrong key must not silently produce a vault that
+            // looks fine but decrypts nothing.
+            let tmp = tempfile::tempdir().unwrap();
+            let paths = VaultPaths::at(tmp.path().join("vault"));
+            paths.ensure_dirs().unwrap();
+            let provider = TpmOuterProvider::new(&paths);
+
+            let original = provider.provision().unwrap();
+            let unrelated = Key::generate().unwrap();
+            provider.provision_with(&unrelated).unwrap();
+
+            let now = provider.unseal().unwrap();
+            assert_eq!(now, unrelated);
+            assert_ne!(now, original, "the wrong key must not resurrect the old one");
+        }
+
+        #[test]
+        #[ignore = "needs a real TPM at /dev/tpmrm0"]
         fn a_tampered_private_area_does_not_unseal() {
             let tmp = tempfile::tempdir().unwrap();
             let paths = VaultPaths::at(tmp.path().join("vault"));

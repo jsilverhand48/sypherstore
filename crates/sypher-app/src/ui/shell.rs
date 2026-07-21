@@ -45,6 +45,7 @@ use smithay_client_toolkit::{
     registry_handlers,
     seat::{
         keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
+        pointer::{PointerEvent, PointerEventKind, PointerHandler},
         Capability, SeatHandler, SeatState,
     },
     shell::{
@@ -57,9 +58,15 @@ use smithay_client_toolkit::{
 };
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_keyboard, wl_output, wl_seat, wl_surface},
+    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface},
     Connection, Proxy, QueueHandle,
 };
+
+/// Linux input codes for the mouse buttons, from `linux/input-event-codes.h`.
+/// Wayland reports these directly rather than a protocol-specific enum.
+const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
+const BTN_MIDDLE: u32 = 0x112;
 
 use crate::state::{DaemonEvent, UiRequest};
 use crate::ui::popup::{Popup, POPUP_SIZE};
@@ -109,12 +116,15 @@ pub fn run(
         renderer,
         window: None,
         keyboard: None,
+        pointer: None,
+        pointer_pos: egui::Pos2::ZERO,
         input: Vec::new(),
         modifiers: egui::Modifiers::NONE,
         scale: 1.0,
         popup,
         should_exit: false,
         start: std::time::Instant::now(),
+        repaint_after: None,
     };
 
     let mut event_loop: calloop::EventLoop<Shell> =
@@ -140,11 +150,20 @@ pub fn run(
 
     while !shell.should_exit {
         // A pending redraw must not block: without a timeout the loop would
-        // sleep until the next input even though egui has asked to animate.
-        let timeout = shell
+        // sleep until the next input even though a frame is owed. Two sources
+        // ask for one, and the sooner wins:
+        //
+        //  - the popup, for its unlock countdown and message expiry;
+        //  - egui itself, for animations and for state that changed during the
+        //    last frame.
+        let ticking = shell
             .popup
             .wants_repaint()
             .then(|| std::time::Duration::from_millis(100));
+        let timeout = match (ticking, shell.repaint_after.take()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         event_loop
             .dispatch(timeout, &mut shell)
             .context("dispatching events")?;
@@ -243,6 +262,12 @@ struct Shell {
 
     window: Option<Window>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
+    pointer: Option<wl_pointer::WlPointer>,
+    /// Last known cursor position, in egui points.
+    ///
+    /// Wayland delivers the position with motion but not with button events,
+    /// so a click carries no coordinates of its own and has to reuse this.
+    pointer_pos: egui::Pos2,
 
     /// Input accumulated since the last frame.
     input: Vec<egui::Event>,
@@ -252,6 +277,13 @@ struct Shell {
     popup: Popup,
     should_exit: bool,
     start: std::time::Instant,
+    /// How soon egui wants to be drawn again.
+    ///
+    /// egui asks for this when anything is mid-animation, and crucially also
+    /// when a widget changed state during the frame. Without honouring it, a
+    /// click that switches the popup's mode would render once and then block,
+    /// leaving the new mode invisible until unrelated input arrived.
+    repaint_after: Option<std::time::Duration>,
 }
 
 impl Shell {
@@ -403,6 +435,15 @@ impl Shell {
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             egui::Frame::central_panel(ui.style()).show(ui, |ui| popup.draw(ui));
         });
+
+        // Ask to be woken again if egui has more to draw. Capped, because
+        // egui reports `Duration::MAX` to mean "nothing pending", which would
+        // overflow the event loop's timeout arithmetic.
+        self.repaint_after = full_output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| v.repaint_delay)
+            .filter(|d| *d < std::time::Duration::from_secs(1));
 
         let paint_jobs = self
             .egui_ctx
@@ -659,6 +700,15 @@ impl SeatHandler for Shell {
                 Err(e) => tracing::error!(error = %e, "could not acquire the keyboard"),
             }
         }
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            match self.seat_state.get_pointer(qh, &seat) {
+                Ok(ptr) => {
+                    tracing::debug!("pointer acquired");
+                    self.pointer = Some(ptr);
+                }
+                Err(e) => tracing::error!(error = %e, "could not acquire the pointer"),
+            }
+        }
     }
 
     fn remove_capability(
@@ -671,6 +721,11 @@ impl SeatHandler for Shell {
         if capability == Capability::Keyboard {
             if let Some(kb) = self.keyboard.take() {
                 kb.release();
+            }
+        }
+        if capability == Capability::Pointer {
+            if let Some(ptr) = self.pointer.take() {
+                ptr.release();
             }
         }
     }
@@ -760,6 +815,97 @@ impl KeyboardHandler for Shell {
             mac_cmd: false,
             command: modifiers.ctrl,
         };
+    }
+}
+
+impl PointerHandler for Shell {
+    fn pointer_frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
+        for event in events {
+            // Only our own surface's events matter. A layer surface can see
+            // events for others on the same seat.
+            if self
+                .window
+                .as_ref()
+                .is_none_or(|w| w.layer.wl_surface() != &event.surface)
+            {
+                continue;
+            }
+
+            let pos = egui::pos2(event.position.0 as f32, event.position.1 as f32);
+
+            match event.kind {
+                PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                    self.pointer_pos = pos;
+                    self.input.push(egui::Event::PointerMoved(pos));
+                }
+                PointerEventKind::Leave { .. } => {
+                    // Without this, egui keeps the last hovered widget lit up
+                    // after the cursor has left the popup entirely.
+                    self.input.push(egui::Event::PointerGone);
+                }
+                PointerEventKind::Press { button, .. }
+                | PointerEventKind::Release { button, .. } => {
+                    let Some(button) = translate_button(button) else {
+                        continue;
+                    };
+                    let pressed = matches!(event.kind, PointerEventKind::Press { .. });
+
+                    // Wayland omits the position on button events, so the
+                    // click is placed at the last motion. Sending a move first
+                    // guarantees egui has registered the position even if the
+                    // press arrives in the same frame as the motion that
+                    // produced it.
+                    self.pointer_pos = pos;
+                    self.input.push(egui::Event::PointerMoved(pos));
+                    self.input.push(egui::Event::PointerButton {
+                        pos,
+                        button,
+                        pressed,
+                        modifiers: self.modifiers,
+                    });
+                }
+                PointerEventKind::Axis {
+                    horizontal,
+                    vertical,
+                    ..
+                } => {
+                    // Wayland reports a positive axis value for scrolling
+                    // down and right. egui's delta describes how the *content*
+                    // moves, which is the opposite direction, so both axes are
+                    // negated. Getting this wrong inverts scrolling, which is
+                    // immediately obvious but easy to introduce.
+                    let delta = egui::vec2(-horizontal.absolute as f32, -vertical.absolute as f32);
+                    if delta != egui::Vec2::ZERO {
+                        self.input.push(egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta,
+                            // A wheel has no touch phase; `Move` is what egui
+                            // documents for that case.
+                            phase: egui::TouchPhase::Move,
+                            modifiers: self.modifiers,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Maps a Linux button code to egui's button enum.
+///
+/// Anything else (side buttons, tilt wheels) is ignored rather than guessed at.
+fn translate_button(code: u32) -> Option<egui::PointerButton> {
+    match code {
+        BTN_LEFT => Some(egui::PointerButton::Primary),
+        BTN_RIGHT => Some(egui::PointerButton::Secondary),
+        BTN_MIDDLE => Some(egui::PointerButton::Middle),
+        _ => None,
     }
 }
 

@@ -69,6 +69,17 @@ dependencies; the two hardware layers enter through the `OuterKeyProvider` and
 envelope, the lock state machine) be tested on any machine, including one with
 no TPM attached.
 
+## Installing
+
+```sh
+./install.sh
+```
+
+Builds a release binary, installs it and the systemd user unit, checks the
+environment, creates the vault, and walks you through storing the recovery key.
+Run it as your normal user; it uses sudo only for the `tss` group and the udev
+rule, and asks first. It refuses to install a `mock-hw` build.
+
 ## Building
 
 ```sh
@@ -108,6 +119,24 @@ if it ends up somewhere less protected than the vault. The flip side is that
 mistakes, not against hardware loss. There is no recovery phrase by design;
 see [the threat model](docs/THREAT_MODEL.md).
 
+## Recovery key
+
+The outer key lives in this machine's TPM. If the TPM is cleared or the machine
+dies, that key goes with it. The recovery key is an escape hatch:
+
+```sh
+sypherstore recovery export                    # print it, to write down
+sypherstore recovery export --out ~/key.txt    # or write to a 0600 file
+sypherstore recovery adopt                     # on a replacement machine
+```
+
+It **cannot read your secrets**: it strips only the machine binding, and every
+secret still needs a touch from your authenticator. But anyone with both the
+recovery key and your YubiKey can open the vault anywhere, so store them
+separately.
+
+Losing the *authenticator* is still unrecoverable. That is by design.
+
 ## Running as a service
 
 ```sh
@@ -142,8 +171,9 @@ Hardware-dependent tests are gated behind `--features hw-tests` and are
   redacted `Debug`. The process sets `PR_SET_DUMPABLE=0` and `RLIMIT_CORE=0` at
   startup.
 - **Root is outside the threat model.** So is a compromised kernel.
-- **Lose the machine or the key and the secrets are gone.** No recovery phrase,
-  no escrow. A passphrase fallback would be a second and much weaker way in.
+- **Lose the authenticator and the secrets are gone.** No passphrase fallback;
+  it would be a second and much weaker way in. A dead TPM is survivable via the
+  recovery key above.
 
 The full analysis, including the gaps, is in [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 

@@ -24,7 +24,9 @@ use sypher_core::vault::db::Vault;
 use sypher_core::vault::paths::VaultPaths;
 use sypher_core::vault::session::Session;
 
-use crate::cli::{AddArgs, Cli, Command, DeleteArgs, DevCommand, ListArgs, RestoreCommand};
+use crate::cli::{
+    AddArgs, Cli, Command, DeleteArgs, DevCommand, ListArgs, RecoveryCommand, RestoreCommand,
+};
 use crate::{doctor, hw};
 
 /// Routes a parsed command to its implementation.
@@ -39,6 +41,7 @@ pub fn dispatch(args: Cli) -> Result<ExitCode> {
         Command::List(a) => cmd_list(&paths, a),
         Command::Delete(a) => cmd_delete(&paths, a),
         Command::Backup => cmd_backup(&paths),
+        Command::Recovery(r) => cmd_recovery(&paths, r),
         Command::Restore(r) => cmd_restore(&paths, r),
         Command::Dev(d) => cmd_dev(&paths, d),
         Command::Daemon => cmd_daemon(&paths),
@@ -202,6 +205,107 @@ fn cmd_delete(paths: &VaultPaths, args: DeleteArgs) -> Result<ExitCode> {
 
     println!("Deleted {:?}", target.name);
     Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_recovery(paths: &VaultPaths, cmd: RecoveryCommand) -> Result<ExitCode> {
+    use sypher_core::vault::recovery;
+
+    match cmd {
+        RecoveryCommand::Export { out, force } => {
+            let session = open_locked_only(paths)?;
+            let key_text = recovery::encode(session.outer_key());
+
+            if !force {
+                eprintln!(
+                    "\nThe recovery key removes this vault's binding to this machine.\n\
+                     \n\
+                     It does NOT open the vault on its own: reading a secret still\n\
+                     requires a touch from your registered authenticator. But anyone\n\
+                     holding BOTH this key and your YubiKey can read the vault on any\n\
+                     computer. Store them in different places.\n\
+                     \n\
+                     Write it on paper. Do not put it in the same password manager it\n\
+                     is meant to recover.\n"
+                );
+                print!("Show the recovery key? [y/N] ");
+                std::io::stdout().flush().ok();
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                    println!("Cancelled. Nothing was written.");
+                    return Ok(ExitCode::SUCCESS);
+                }
+            }
+
+            match out {
+                Some(path) => {
+                    // A file avoids the terminal entirely, which matters
+                    // because scrollback and session logs outlive the command.
+                    sypher_core::vault::paths::write_private_atomic(
+                        &path,
+                        format!("{key_text}\n").as_bytes(),
+                    )
+                    .context("writing the recovery key")?;
+                    println!("Recovery key written to {} (mode 0600).", path.display());
+                    println!("Move it offline and delete this copy.");
+                }
+                None => {
+                    println!("\n  {key_text}\n");
+                    eprintln!(
+                        "This is now in your terminal scrollback. Clear it when you are done."
+                    );
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+
+        RecoveryCommand::Adopt { force } => {
+            if !paths.db().exists() {
+                bail!(
+                    "no vault database at {}. Copy the vault directory here first.",
+                    paths.db().display()
+                );
+            }
+
+            eprintln!(
+                "This re-seals an existing vault to THIS machine's TPM.\n\
+                 You will still need the authenticator the vault was created with.\n"
+            );
+            let key_text = rpassword::prompt_password("Recovery key: ")
+                .context("reading the recovery key")?;
+            let key = recovery::decode(&key_text).context("the recovery key was not accepted")?;
+
+            if !force {
+                print!(
+                    "Seal this key to the TPM on this machine, replacing any existing seal at {}? [y/N] ",
+                    paths.root.display()
+                );
+                std::io::stdout().flush().ok();
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                    println!("Cancelled.");
+                    return Ok(ExitCode::SUCCESS);
+                }
+            }
+
+            paths.ensure_dirs().context("creating the vault directory")?;
+            hw::outer(paths)
+                .provision_with(&key)
+                .context("sealing the recovered key to this TPM")?;
+
+            // Prove it worked now rather than at the next hotkey press.
+            let session = open_locked_only(paths).context(
+                "the key was sealed, but the vault still will not open. \
+                 The recovery key may belong to a different vault.",
+            )?;
+            let count = session.list()?.len();
+
+            println!("Vault adopted on this machine. {count} secret(s) available.");
+            println!("Touch your authenticator to use them: `sypherstore dev unlock-test`.");
+            Ok(ExitCode::SUCCESS)
+        }
+    }
 }
 
 /// Writes an encrypted snapshot.

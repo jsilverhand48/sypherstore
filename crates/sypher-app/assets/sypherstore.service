@@ -1,0 +1,51 @@
+# Sypherstore daemon, as a systemd user unit.
+#
+# Install with:
+#   mkdir -p ~/.config/systemd/user
+#   cp crates/sypher-app/assets/sypherstore.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now sypherstore
+#
+# This is a *user* unit, never a system one. The daemon must run as you, in
+# your graphical session: it needs your Wayland socket, your D-Bus session bus,
+# and your vault directory. Running it as root would break all three and gain
+# nothing.
+
+[Unit]
+Description=Sypherstore secret manager
+Documentation=file:%h/.local/share/sypherstore
+# The popup is a Wayland layer surface, so there is nothing to do without a
+# graphical session.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/sypherstore daemon
+Restart=on-failure
+# A crash loop against a missing TPM or an unplugged key should back off rather
+# than hammer the hardware.
+RestartSec=5s
+
+# Core dumps would contain unlocked keys in the clear. The daemon also sets
+# RLIMIT_CORE itself; this is belt and braces, and additionally stops
+# systemd-coredump from capturing anything.
+LimitCORE=0
+
+# The daemon mlocks its key material. The default limit is enough for the few
+# small buffers involved, but being explicit means a restrictive system-wide
+# default cannot silently degrade the guarantee.
+LimitMEMLOCK=1M
+
+# Deliberately NOT set: NoNewPrivileges, ProtectHome, PrivateTmp and the
+# various sandboxing options. The daemon needs /dev/tpmrm0, /dev/hidraw*, the
+# Wayland socket, the session bus and the XDG portals; every hardening option
+# that isolates those breaks a core feature. Confining it properly needs a
+# tailored DeviceAllow set, which is future work.
+#
+# Note also that PrivateUsers or anything that alters /proc visibility will
+# break xdg-desktop-portal's caller identification, which is how the global
+# hotkey and the paste engine are authorized. See secure::disable_ptrace.
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,40 @@
+[package]
+name = "sypher-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Hardware-free core of Sypherstore: crypto envelope, vault storage, search."
+
+[features]
+default = []
+# File-backed stand-ins for the TPM and FIDO2 key providers. Development and
+# tests only: the key material lives in plain files under the vault directory.
+mock-hw = []
+
+[dependencies]
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+getrandom.workspace = true
+zeroize.workspace = true
+secrecy.workspace = true
+memsec.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+ciborium.workspace = true
+uuid.workspace = true
+
+rusqlite.workspace = true
+
+nucleo-matcher.workspace = true
+psl.workspace = true
+
+thiserror.workspace = true
+tracing.workspace = true
+libc.workspace = true
+dirs.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

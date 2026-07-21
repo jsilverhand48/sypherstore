@@ -1,0 +1,61 @@
+[package]
+name = "sypher-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Sypherstore daemon and CLI."
+
+[[bin]]
+name = "sypherstore"
+path = "src/main.rs"
+
+[features]
+default = []
+# Swap the TPM and FIDO2 layers for file-backed mocks. Development only:
+# a vault built this way has no hardware protection at all.
+mock-hw = ["sypher-core/mock-hw"]
+# Opt in to tests that need a real TPM and YubiKey present.
+hw-tests = []
+
+[dependencies]
+sypher-core = { path = "../sypher-core" }
+
+clap = { version = "4", features = ["derive", "env"] }
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+libc.workspace = true
+dirs.workspace = true
+
+# Reads a secret from the terminal without echoing it.
+rpassword = "7"
+
+# Desktop integration: portals, GUI, key injection.
+ashpd.workspace = true
+zbus.workspace = true
+smithay-client-toolkit.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+wgpu.workspace = true
+raw-window-handle.workspace = true
+calloop.workspace = true
+calloop-wayland-source.workspace = true
+wayland-client.workspace = true
+pollster.workspace = true
+xkeysym.workspace = true
+futures-util.workspace = true
+wl-clipboard-rs.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# Hardware layers.
+tss-esapi.workspace = true
+ctap-hid-fido2.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

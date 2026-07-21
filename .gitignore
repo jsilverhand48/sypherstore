@@ -1,0 +1,5 @@
+docs/
+target/
+**/*.rs.bk
+rustc-ice-*.txt
+**/mutants.out/

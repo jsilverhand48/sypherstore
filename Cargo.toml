@@ -1,0 +1,85 @@
+[workspace]
+resolver = "2"
+members = ["crates/sypher-core", "crates/sypher-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace.dependencies]
+# Crypto
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+# "std" makes getrandom::Error implement std::error::Error, which thiserror's
+# #[from] requires.
+getrandom = { version = "0.2", features = ["std"] }
+zeroize = { version = "1.8", features = ["derive"] }
+secrecy = "0.10"
+memsec = "0.7"
+
+# Serialization / data
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ciborium = "0.2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Search
+nucleo-matcher = "0.3"
+psl = "2"
+
+# Errors / logging
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Desktop integration. `default-features = false` keeps the GTK/glib backends
+# out; we only need the portal protocol itself, driven by tokio.
+ashpd = { version = "0.13", default-features = false, features = [
+    "tokio",
+    "global_shortcuts",
+    "remote_desktop",
+    "screencast",
+] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+# The popup is a wlr layer-shell surface, not an xdg-toplevel: winit's Wayland
+# backend cannot map or unmap a window on demand (`set_visible` is a no-op
+# there), and layer-shell additionally grants exclusive keyboard focus. So the
+# windowing layer is hand-rolled on sctk rather than delegated to eframe.
+# `system` makes wayland-client bind libwayland rather than use its pure-Rust
+# backend. wgpu needs a real `wl_display` pointer to create a surface, and only
+# the libwayland-backed build can hand one out.
+smithay-client-toolkit = { version = "0.21", features = ["system"] }
+egui = { version = "0.35", default-features = false, features = ["default_fonts"] }
+egui-wgpu = "0.35"
+wgpu = "29"
+raw-window-handle = "0.6"
+calloop = "0.14"
+calloop-wayland-source = "0.4"
+wayland-client = { version = "0.31", features = ["log"] }
+pollster = "0.4"
+xkeysym = "0.2"
+futures-util = "0.3"
+wl-clipboard-rs = "0.9"
+
+# Hardware layers. Only used by the non-mock build.
+tss-esapi = "7"
+ctap-hid-fido2 = "3"
+
+# Async / platform
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+libc = "0.2"
+dirs = "5"
+
+[profile.release]
+# Keep panics from unwinding through FFI (tss-esapi / ctap-hid-fido2) and
+# strip symbols that would otherwise leak internal names into the binary.
+panic = "abort"
+strip = "symbols"
+lto = "thin"

@@ -28,17 +28,35 @@
 
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::crypto::envelope::{self, EnvelopeError};
 use crate::crypto::keys::{
-    derive_inner_kek, InnerKeyProvider, Key, OuterKeyProvider, ProviderError,
+    derive_wrap_key, InnerKeyProvider, Key, OuterKeyProvider, ProviderError,
 };
 use crate::model::{SecretMeta, SecretPayload};
 use crate::vault::db::{
-    Vault, VaultError, META_CREDENTIAL_ID, META_HMAC_SALT, META_KDF_SALT, META_VERIFY_BLOB,
+    Vault, VaultError, META_ENROLLMENTS, META_HMAC_SALT, META_KDF_SALT, META_VERIFY_BLOB,
     META_VERIFY_ID,
 };
+
+/// One enrolled authenticator's record: how to recognise it and its wrapped
+/// copy of the vault's `inner_kek`.
+///
+/// Stored as a CBOR list in the `meta` table. `credential_id` is the opaque
+/// non-resident handle the authenticator returned at enrollment; `wrap_blob` is
+/// `inner_kek` sealed under the wrap key derived from this key's hmac-secret.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Enrollment {
+    /// Human label, e.g. "primary" or "backup", shown when listing keys.
+    #[serde(rename = "l")]
+    label: String,
+    #[serde(rename = "c")]
+    credential_id: Vec<u8>,
+    #[serde(rename = "w")]
+    wrap_blob: Vec<u8>,
+}
 
 /// Whether the vault currently holds an inner key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +84,15 @@ pub enum SessionError {
          wrong YubiKey, or the vault was moved from another machine"
     )]
     VerificationFailed,
+    #[error(
+        "the authenticator that answered is not enrolled in this vault. \
+         Use a registered key, or enroll this one from an unlocked session."
+    )]
+    NoMatchingKey,
+    #[error("the vault's enrollment record is corrupt: {0}")]
+    BadEnrollments(String),
+    #[error("that authenticator is already enrolled in this vault")]
+    AlreadyEnrolled,
     #[error(transparent)]
     Vault(#[from] VaultError),
     #[error(transparent)]
@@ -106,26 +133,32 @@ impl Session {
         }
 
         let outer_kek = outer.provision()?;
-        let credential_id = inner.provision()?;
+
+        // The key that actually encrypts secrets is random and generated here,
+        // not derived from the authenticator. Each enrolled key stores a
+        // wrapped copy of it, which is what lets a backup key open the vault.
+        let inner_kek = Key::generate()?;
 
         let kdf_salt = crate::crypto::keys::generate_salt()?;
         let hmac_salt = crate::crypto::keys::generate_salt()?;
 
-        // Derive the inner key immediately so init fails loudly here rather
-        // than at first unlock if the authenticator misbehaves.
-        let assertion = inner.assert_secret(&credential_id, &hmac_salt)?;
-        let inner_kek = derive_inner_kek(assertion.as_slice(), &kdf_salt)?;
+        // Register the primary authenticator and wrap inner_kek under it. Doing
+        // the assertion now means init fails loudly here rather than at first
+        // unlock if the authenticator misbehaves.
+        let credential_id = inner.provision()?;
+        let primary = wrap_for(inner, &credential_id, &hmac_salt, &kdf_salt, &inner_kek, "primary")?;
+        let enrollments = vec![primary];
 
         let verify_id = Uuid::new_v4();
         let verify_blob = envelope::seal_verification(&verify_id, &inner_kek, &outer_kek)?;
 
         vault.set_meta_bytes(META_KDF_SALT, &kdf_salt)?;
         vault.set_meta_bytes(META_HMAC_SALT, &hmac_salt)?;
-        vault.set_meta_bytes(META_CREDENTIAL_ID, &credential_id)?;
+        save_enrollments(&vault, &enrollments)?;
         vault.set_meta_bytes(META_VERIFY_BLOB, &verify_blob)?;
         vault.set_meta(META_VERIFY_ID, &verify_id.to_string())?;
 
-        tracing::info!("vault initialized");
+        tracing::info!("vault initialized with 1 enrolled authenticator");
         Ok(Self {
             vault,
             outer_kek,
@@ -133,6 +166,55 @@ impl Session {
             deadline: Some(Instant::now() + timeout),
             timeout,
         })
+    }
+
+    /// Enrolls an additional authenticator so it can also open this vault.
+    ///
+    /// Requires the session to be unlocked: enrolling a backup means wrapping
+    /// the *existing* `inner_kek` under the new key, and that key is only in
+    /// hand once an already-enrolled key has unlocked. This is the "primary
+    /// present" model, the new authenticator is added alongside the old, and
+    /// every existing secret stays readable by both.
+    ///
+    /// Prompts the new key twice: once to register a credential, once to derive
+    /// its wrap key.
+    pub fn enroll_key(
+        &mut self,
+        inner: &dyn InnerKeyProvider,
+        label: &str,
+    ) -> Result<(), SessionError> {
+        self.ensure_unlocked()?;
+        let inner_kek = self.inner_kek.clone().ok_or(SessionError::Locked)?;
+
+        let hmac_salt = self.vault.require_meta_bytes(META_HMAC_SALT)?;
+        let kdf_salt = self.vault.require_meta_bytes(META_KDF_SALT)?;
+        let mut enrollments = load_enrollments(&self.vault)?;
+
+        let credential_id = inner.provision()?;
+        if enrollments.iter().any(|e| e.credential_id == credential_id) {
+            return Err(SessionError::AlreadyEnrolled);
+        }
+
+        let label = if label.trim().is_empty() {
+            format!("key-{}", enrollments.len() + 1)
+        } else {
+            label.trim().to_string()
+        };
+        let enrollment = wrap_for(inner, &credential_id, &hmac_salt, &kdf_salt, &inner_kek, &label)?;
+        enrollments.push(enrollment);
+        save_enrollments(&self.vault, &enrollments)?;
+
+        self.touch();
+        tracing::info!(count = enrollments.len(), label = %label, "enrolled an authenticator");
+        Ok(())
+    }
+
+    /// Labels of every enrolled authenticator. Needs no key.
+    pub fn enrolled_labels(&self) -> Result<Vec<String>, SessionError> {
+        Ok(load_enrollments(&self.vault)?
+            .into_iter()
+            .map(|e| e.label)
+            .collect())
     }
 
     /// Opens an existing vault, recovering the outer key only.
@@ -164,12 +246,32 @@ impl Session {
     /// into an immediate, clear error instead of a confusing decryption
     /// failure the next time the user tries to paste something.
     pub fn unlock(&mut self, inner: &dyn InnerKeyProvider) -> Result<(), SessionError> {
-        let credential_id = self.vault.require_meta_bytes(META_CREDENTIAL_ID)?;
         let hmac_salt = self.vault.require_meta_bytes(META_HMAC_SALT)?;
         let kdf_salt = self.vault.require_meta_bytes(META_KDF_SALT)?;
+        let enrollments = load_enrollments(&self.vault)?;
 
-        let assertion = inner.assert_secret(&credential_id, &hmac_salt)?;
-        let inner_kek = derive_inner_kek(assertion.as_slice(), &kdf_salt)?;
+        // One assertion carrying every enrolled credential in its allow-list.
+        // The authenticator answers for whichever it holds and tells us which,
+        // so a two-key vault opens with a single touch.
+        let credential_ids: Vec<Vec<u8>> =
+            enrollments.iter().map(|e| e.credential_id.clone()).collect();
+        let (matched_id, assertion) = inner.assert_first_available(&credential_ids, &hmac_salt)?;
+
+        let enrollment = enrollments
+            .iter()
+            .find(|e| e.credential_id == matched_id)
+            .ok_or(SessionError::NoMatchingKey)?;
+
+        // Derive this key's wrap key and unwrap its copy of inner_kek. A wrong
+        // key fails the AEAD tag here.
+        let wrap = derive_wrap_key(assertion.as_slice(), &kdf_salt)?;
+        let inner_kek = match envelope::unwrap_key(&wrap, &enrollment.wrap_blob) {
+            Ok(k) => k,
+            Err(_) => {
+                tracing::warn!(label = %enrollment.label, "unlock rejected: could not unwrap inner key");
+                return Err(SessionError::VerificationFailed);
+            }
+        };
 
         let verify_blob = self.vault.require_meta_bytes(META_VERIFY_BLOB)?;
         let verify_id = self
@@ -188,7 +290,11 @@ impl Session {
 
         self.inner_kek = Some(inner_kek);
         self.deadline = Some(Instant::now() + self.timeout);
-        tracing::info!(timeout_secs = self.timeout.as_secs(), "vault unlocked");
+        tracing::info!(
+            timeout_secs = self.timeout.as_secs(),
+            key = %enrollment.label,
+            "vault unlocked"
+        );
         Ok(())
     }
 
@@ -268,9 +374,33 @@ impl Session {
         &self.outer_kek
     }
 
-    /// Lists metadata for the popup. Deliberately available while locked.
-    pub fn list(&self) -> Result<Vec<SecretMeta>, SessionError> {
-        Ok(self.vault.list_meta()?)
+    /// Lists metadata for the popup, newest-updated first.
+    ///
+    /// Requires an unlock: every row's metadata is sealed, so the list cannot
+    /// be built without the inner key. This is the change that makes the popup
+    /// show nothing until the YubiKey is present.
+    pub fn list(&mut self) -> Result<Vec<SecretMeta>, SessionError> {
+        self.ensure_unlocked()?;
+        let (inner, outer) = self.keys()?;
+        let rows = self.vault.list_rows()?;
+
+        let mut metas = Vec::with_capacity(rows.len());
+        for row in rows {
+            let meta = envelope::open_meta(&row.meta_id, &row.id, inner, outer, &row.meta_blob)?;
+            metas.push(meta);
+        }
+        // The sort key lives inside the sealed blob, so ordering happens here
+        // rather than in SQL.
+        metas.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(metas)
+    }
+
+    /// Decrypts one secret's metadata. Requires an unlock.
+    pub fn meta_for(&mut self, id: &Uuid) -> Result<SecretMeta, SessionError> {
+        let row = self.vault.get_meta_row(id)?;
+        self.ensure_unlocked()?;
+        let (inner, outer) = self.keys()?;
+        Ok(envelope::open_meta(&row.meta_id, &row.id, inner, outer, &row.meta_blob)?)
     }
 
     /// Advances the state machine and fails if that left the vault locked.
@@ -305,7 +435,8 @@ impl Session {
         Ok(payload)
     }
 
-    /// Seals and stores a new secret.
+    /// Seals and stores a new secret: metadata and payload in separate
+    /// envelopes, plus a fresh random UUID for the metadata envelope.
     pub fn add(
         &mut self,
         meta: &SecretMeta,
@@ -313,14 +444,20 @@ impl Session {
     ) -> Result<(), SessionError> {
         self.ensure_unlocked()?;
         let (inner, outer) = self.keys()?;
-        let blob = envelope::seal_payload(&meta.id, inner, outer, payload)?;
-        self.vault.insert(meta, &blob)?;
+        let meta_id = Uuid::new_v4();
+        let meta_blob = envelope::seal_meta(&meta_id, inner, outer, meta)?;
+        let payload_blob = envelope::seal_payload(&meta.id, inner, outer, payload)?;
+        self.vault.insert_row(&meta.id, &meta_id, &meta_blob, &payload_blob)?;
         self.touch();
-        tracing::info!(secret_id = %meta.id, name = %meta.name, "secret added");
+        tracing::info!(secret_id = %meta.id, "secret added");
         Ok(())
     }
 
     /// Re-seals and replaces an existing secret.
+    ///
+    /// The metadata envelope's UUID is rotated on every update, so an observer
+    /// diffing the database cannot even tell that a row's metadata was replaced
+    /// with the same content.
     pub fn update(
         &mut self,
         meta: &SecretMeta,
@@ -328,8 +465,10 @@ impl Session {
     ) -> Result<(), SessionError> {
         self.ensure_unlocked()?;
         let (inner, outer) = self.keys()?;
-        let blob = envelope::seal_payload(&meta.id, inner, outer, payload)?;
-        self.vault.update(meta, &blob)?;
+        let meta_id = Uuid::new_v4();
+        let meta_blob = envelope::seal_meta(&meta_id, inner, outer, meta)?;
+        let payload_blob = envelope::seal_payload(&meta.id, inner, outer, payload)?;
+        self.vault.update_row(&meta.id, &meta_id, &meta_blob, &payload_blob)?;
         self.touch();
         tracing::info!(secret_id = %meta.id, "secret updated");
         Ok(())
@@ -343,6 +482,44 @@ impl Session {
         tracing::info!(secret_id = %id, "secret deleted");
         Ok(())
     }
+}
+
+/// Registers one authenticator's wrapped copy of `inner_kek`.
+///
+/// Performs the assertion (one touch) and seals `inner_kek` under the wrap key
+/// derived from it. Shared by init (the primary) and `enroll_key` (a backup).
+fn wrap_for(
+    inner: &dyn InnerKeyProvider,
+    credential_id: &[u8],
+    hmac_salt: &[u8],
+    kdf_salt: &[u8],
+    inner_kek: &Key,
+    label: &str,
+) -> Result<Enrollment, SessionError> {
+    let assertion = inner.assert_secret(credential_id, hmac_salt)?;
+    let wrap = derive_wrap_key(assertion.as_slice(), kdf_salt)?;
+    let wrap_blob = envelope::wrap_key(&wrap, inner_kek)?;
+    Ok(Enrollment {
+        label: label.to_string(),
+        credential_id: credential_id.to_vec(),
+        wrap_blob,
+    })
+}
+
+/// Reads the enrolled-authenticator list from the vault's meta table.
+fn load_enrollments(vault: &Vault) -> Result<Vec<Enrollment>, SessionError> {
+    let bytes = vault.require_meta_bytes(META_ENROLLMENTS)?;
+    ciborium::from_reader(bytes.as_slice())
+        .map_err(|e| SessionError::BadEnrollments(e.to_string()))
+}
+
+/// Writes the enrolled-authenticator list back to the vault's meta table.
+fn save_enrollments(vault: &Vault, enrollments: &[Enrollment]) -> Result<(), SessionError> {
+    let mut bytes = Vec::new();
+    ciborium::into_writer(enrollments, &mut bytes)
+        .map_err(|e| SessionError::BadEnrollments(e.to_string()))?;
+    vault.set_meta_bytes(META_ENROLLMENTS, &bytes)?;
+    Ok(())
 }
 
 #[cfg(all(test, feature = "mock-hw"))]
@@ -411,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reopened_vault_starts_locked_but_lists_metadata() {
+    fn a_reopened_vault_starts_locked_and_reveals_nothing_until_unlocked() {
         let fx = Fixture::new();
         let (meta, payload) = sample();
         {
@@ -422,16 +599,17 @@ mod tests {
         let mut s = fx.reopen(Duration::from_secs(60));
         assert!(!s.is_unlocked());
 
-        // Metadata is readable with no touch: this is what makes the popup
-        // appear instantly.
+        // Metadata is now sealed: neither the list nor a single secret is
+        // readable without a touch. The row count leaks, nothing else.
+        assert!(matches!(s.list(), Err(SessionError::Locked)));
+        assert!(matches!(s.open(&meta.id), Err(SessionError::Locked)));
+        assert_eq!(s.vault().count().unwrap(), 1);
+
+        s.unlock(&fx.inner()).unwrap();
         let listed = s.list().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name, "GitHub");
-
-        // The secret itself is not.
-        assert!(matches!(s.open(&meta.id), Err(SessionError::Locked)));
-
-        s.unlock(&fx.inner()).unwrap();
+        assert_eq!(listed[0].domain, "github.com");
         assert_eq!(s.open(&meta.id).unwrap(), payload);
     }
 
@@ -524,7 +702,8 @@ mod tests {
         let mut s = fx.reopen(Duration::from_secs(60));
         assert!(!s.is_unlocked());
         s.delete(&meta.id).unwrap();
-        assert!(s.list().unwrap().is_empty());
+        // Deletion needs no key; confirm via the count, which also needs none.
+        assert_eq!(s.vault().count().unwrap(), 0);
     }
 
     #[test]
@@ -599,11 +778,13 @@ mod tests {
     }
 
     #[test]
-    fn ciphertext_in_the_database_does_not_contain_the_secret() {
+    fn ciphertext_in_the_database_does_not_contain_the_secret_or_metadata() {
         let fx = Fixture::new();
         let mut s = fx.init(Duration::from_secs(60));
-        let mut meta = SecretMeta::new("Bank", SecretType::Password);
-        meta.domain = "bank.example".into();
+        let mut meta = SecretMeta::new("MyBankName", SecretType::Password);
+        meta.domain = "bank-needle.example".into();
+        meta.username = "account-holder-needle".into();
+        meta.tags = vec!["tag-needle".into()];
         s.add(
             &meta,
             &SecretPayload::new(SecureBuf::copy_from(b"needle-in-haystack")),
@@ -612,10 +793,115 @@ mod tests {
         drop(s);
 
         let raw = std::fs::read(fx.paths.db()).unwrap();
-        assert!(
-            !raw.windows(18).any(|w| w == b"needle-in-haystack"),
-            "plaintext found in vault.db"
-        );
+        // Neither the secret nor any metadata field may appear in the clear now
+        // that metadata is sealed too.
+        for needle in [
+            b"needle-in-haystack".as_slice(),
+            b"MyBankName".as_slice(),
+            b"bank-needle.example".as_slice(),
+            b"account-holder-needle".as_slice(),
+            b"tag-needle".as_slice(),
+        ] {
+            assert!(
+                !raw.windows(needle.len()).any(|w| w == needle),
+                "cleartext {:?} found in vault.db",
+                String::from_utf8_lossy(needle)
+            );
+        }
+    }
+
+    /// A test authenticator that answers for exactly one credential id, the way
+    /// a real physical key holds one non-resident credential. Two of these
+    /// stand in for two separate YubiKeys.
+    struct OneKey {
+        credential_id: Vec<u8>,
+        seed: [u8; 8],
+    }
+
+    impl OneKey {
+        fn new(tag: u8) -> Self {
+            Self {
+                credential_id: vec![tag; 16],
+                seed: [tag; 8],
+            }
+        }
+    }
+
+    impl crate::crypto::keys::InnerKeyProvider for OneKey {
+        fn provision(&self) -> Result<Vec<u8>, ProviderError> {
+            Ok(self.credential_id.clone())
+        }
+
+        fn assert_secret(&self, credential_id: &[u8], salt: &[u8]) -> Result<SecureBuf, ProviderError> {
+            if credential_id != self.credential_id {
+                // This physical key does not hold that credential.
+                return Err(ProviderError::NoDevice("credential not on this key".into()));
+            }
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(self.seed);
+            h.update(credential_id);
+            h.update(salt);
+            let mut out = h.finalize();
+            Ok(SecureBuf::take_from(out.as_mut_slice()))
+        }
+    }
+
+    #[test]
+    fn a_backup_key_can_be_enrolled_and_opens_the_vault_alone() {
+        let fx = Fixture::new();
+        let primary = OneKey::new(1);
+        let backup = OneKey::new(2);
+        let (meta, payload) = sample();
+
+        // Create with the primary and store a secret.
+        {
+            let vault = Vault::open(&fx.paths).unwrap();
+            let mut s =
+                Session::initialize(vault, &fx.outer(), &primary, Duration::from_secs(60)).unwrap();
+            s.add(&meta, &payload).unwrap();
+            // Enrolling the backup requires an unlocked session (primary present).
+            s.enroll_key(&backup, "backup").unwrap();
+            assert_eq!(s.enrolled_labels().unwrap(), vec!["primary", "backup"]);
+        }
+
+        // Reopen and unlock with ONLY the backup key. The primary's credential
+        // is in the allow-list but the backup does not hold it, so the vault
+        // must open via the backup's own wrapped copy of inner_kek.
+        let mut s = fx.reopen(Duration::from_secs(60));
+        s.unlock(&backup).unwrap();
+        assert_eq!(s.open(&meta.id).unwrap(), payload);
+        assert_eq!(s.list().unwrap()[0].name, "GitHub");
+    }
+
+    #[test]
+    fn enrolling_a_second_time_with_the_same_key_is_refused() {
+        let fx = Fixture::new();
+        let primary = OneKey::new(1);
+        let vault = Vault::open(&fx.paths).unwrap();
+        let mut s =
+            Session::initialize(vault, &fx.outer(), &primary, Duration::from_secs(60)).unwrap();
+        assert!(matches!(
+            s.enroll_key(&primary, "again"),
+            Err(SessionError::AlreadyEnrolled)
+        ));
+    }
+
+    #[test]
+    fn an_unenrolled_key_cannot_unlock() {
+        let fx = Fixture::new();
+        let primary = OneKey::new(1);
+        let stranger = OneKey::new(9);
+        {
+            let vault = Vault::open(&fx.paths).unwrap();
+            let _ =
+                Session::initialize(vault, &fx.outer(), &primary, Duration::from_secs(60)).unwrap();
+        }
+        let mut s = fx.reopen(Duration::from_secs(60));
+        // The stranger holds no enrolled credential, so the allow-list assertion
+        // finds nothing to answer with.
+        assert!(s.unlock(&stranger).is_err());
+        assert!(!s.is_unlocked());
     }
 
     #[test]

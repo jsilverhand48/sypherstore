@@ -1,14 +1,16 @@
 //! The vault's data model.
 //!
 //! The central split in this file is between [`SecretMeta`] and
-//! [`SecretPayload`]. Metadata is stored in the clear and is what the popup
-//! renders and searches; the payload is what lives inside the double-encrypted
-//! envelope and only exists in memory while the vault is unlocked.
+//! [`SecretPayload`]. Both halves are now stored encrypted: metadata (name,
+//! site, username, tags, ...) is sealed in its own double envelope, and the
+//! payload in another. Neither is readable until the vault is unlocked with a
+//! YubiKey, so an attacker with `vault.db` learns nothing about which sites you
+//! have accounts on.
 //!
-//! Keeping them in separate types is a load-bearing safety property, not just
-//! organization: the popup list can be built without ever holding an inner
-//! key, and no code path can accidentally serialize a payload into a metadata
-//! column, because the columns take `SecretMeta` fields only.
+//! Keeping them in separate types is still a load-bearing safety property, not
+//! just organization: they use separate envelopes bound to separate UUIDs, so
+//! no code path can decrypt a payload where it expected metadata or vice versa,
+//! and only the metadata half is ever serialized for the searchable list.
 
 use std::fmt;
 
@@ -116,12 +118,12 @@ impl fmt::Display for SecretType {
     }
 }
 
-/// The cleartext half of a secret: everything needed to find and display it.
+/// The searchable half of a secret: everything needed to find and display it.
 ///
-/// Deliberately contains no secret value. The username is here because domain
-/// filtering and search need it and because the popup shows it to disambiguate
-/// two accounts on the same site; it is the one field where searchability was
-/// chosen over confidentiality, and the spec's threat model accepts that.
+/// Contains no secret value, but it is no longer stored in the clear: it is
+/// sealed in its own envelope and only reconstructed after an unlock, so the
+/// popup's list is empty until the YubiKey is present. Names, sites, usernames
+/// and tags are all confidential at rest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretMeta {
     pub id: Uuid,
@@ -193,6 +195,62 @@ impl SecretPayload {
             .iter()
             .find(|(k, _)| k == label)
             .map(|(_, v)| v)
+    }
+}
+
+/// Wire form of [`SecretMeta`], used only inside the metadata envelope.
+///
+/// The secret's own UUID is *not* serialized here: it is the plaintext row key
+/// and is supplied back at decode time. Everything else that used to be a
+/// plaintext column now travels inside this CBOR blob.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct MetaWire {
+    #[serde(rename = "n")]
+    pub name: String,
+    #[serde(rename = "d", default, skip_serializing_if = "String::is_empty")]
+    pub domain: String,
+    #[serde(rename = "a", default, skip_serializing_if = "String::is_empty")]
+    pub application: String,
+    #[serde(rename = "t")]
+    pub secret_type: String,
+    #[serde(rename = "u", default, skip_serializing_if = "String::is_empty")]
+    pub username: String,
+    #[serde(rename = "g", default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(rename = "c")]
+    pub created_at: i64,
+    #[serde(rename = "m")]
+    pub updated_at: i64,
+}
+
+impl MetaWire {
+    pub(crate) fn from_meta(m: &SecretMeta) -> Self {
+        Self {
+            name: m.name.clone(),
+            domain: m.domain.clone(),
+            application: m.application.clone(),
+            secret_type: m.secret_type.as_str().to_string(),
+            username: m.username.clone(),
+            tags: m.tags.clone(),
+            created_at: m.created_at,
+            updated_at: m.updated_at,
+        }
+    }
+
+    /// Rebuilds the full record, taking the plaintext row id back from the
+    /// caller since it was never sealed.
+    pub(crate) fn into_meta(self, id: Uuid) -> SecretMeta {
+        SecretMeta {
+            id,
+            name: self.name,
+            domain: self.domain,
+            application: self.application,
+            secret_type: SecretType::from_str_lenient(&self.secret_type),
+            username: self.username,
+            tags: self.tags,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
     }
 }
 

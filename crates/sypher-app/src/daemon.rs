@@ -315,9 +315,11 @@ async fn worker_loop(args: WorkerArgs, mut shutdown: tokio_mpsc::UnboundedReceiv
 
 /// Handles a hotkey press.
 ///
-/// Loading metadata is cheap and needs no key, so the popup is shown
-/// immediately and populated in the same breath. The unlock, which may block
-/// on a touch, is started separately and reported when it finishes.
+/// Metadata is now encrypted, so the list cannot be shown until the vault is
+/// unlocked. The popup opens immediately (empty while locked) and the unlock,
+/// which blocks on a touch and PIN, runs separately; when it finishes the list
+/// is decrypted and pushed to the popup. When the vault is already unlocked the
+/// list is loaded up front so the popup appears populated.
 async fn on_hotkey(
     shared: &Arc<Shared>,
     paths: &VaultPaths,
@@ -326,22 +328,28 @@ async fn on_hotkey(
     ui: &UiHandle,
     pin_broker: &Arc<PinBroker>,
 ) {
-    let secrets = match shared.with_session(|s| s.list()) {
-        Ok(secrets) => secrets,
-        Err(e) => {
-            tracing::error!(error = %e, "could not read the vault");
-            ui.error(format!("Could not read the vault: {e}"));
-            return;
+    let (host, application) = detect_context(config, tracker).await;
+
+    let unlocked = shared.ui_lock_state().is_unlocked();
+    let secrets = if unlocked {
+        match shared.with_session(|s| s.list()) {
+            Ok(secrets) => secrets,
+            Err(e) => {
+                tracing::error!(error = %e, "could not read the vault");
+                Vec::new()
+            }
         }
+    } else {
+        // Locked: reveal nothing. The list arrives via Refresh after unlock.
+        Vec::new()
     };
 
-    let (host, application) = detect_context(config, tracker).await;
     ui.show(secrets, host, application);
     ui.lock_changed(shared.ui_lock_state());
 
     // Unlocking up front means the secret is ready by the time the user has
     // typed enough to pick one, rather than making them wait afterwards.
-    if !shared.ui_lock_state().is_unlocked() {
+    if !unlocked {
         start_unlock(shared, paths, ui, pin_broker);
     } else {
         shared.with_session(|s| s.touch());
@@ -413,7 +421,7 @@ async fn on_request(
             }
 
             let result = shared.with_session(|s| {
-                let meta = s.vault().get_meta_for(&id)?;
+                let meta = s.meta_for(&id)?;
                 let payload = s.open(&id)?;
                 Ok::<_, sypher_core::vault::session::SessionError>((meta, payload))
             });
@@ -559,6 +567,9 @@ fn start_unlock(
             Ok(()) => {
                 tracing::info!("unlocked via popup");
                 ui.lock_changed(shared.ui_lock_state());
+                // The list was empty while locked; now that metadata can be
+                // decrypted, push the real contents to the popup.
+                refresh(&shared, &ui);
                 ui.status("Unlocked.");
             }
             Err(e) => {

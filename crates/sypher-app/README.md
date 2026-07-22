@@ -55,8 +55,9 @@ translation before the state machine.
 | `doctor` | no | Environment checks. Exits non-zero on any failure. |
 | `init` | yes | Creates the vault, seals the machine key, registers a credential. |
 | `add <name>` | yes | Prompts for the secret without echo, or `--stdin`. |
-| `list [query]` | no | Metadata only. `--host` filters by site. |
-| `delete <target>` | no | Deleting a row needs no key. `VACUUM`s afterwards. |
+| `list [query]` | yes | Metadata is encrypted, so listing unlocks. `--host` filters by site. |
+| `delete <target>` | yes | Resolving a name needs an unlock; the touch is also the required reauth. `VACUUM`s afterwards. |
+| `enroll-key [--label]` | yes | Enrolls a backup authenticator. Unlock with an enrolled key, then present the new one. |
 | `dev decrypt <target>` | yes | Prints a secret. Development only. |
 | `dev unlock-test` | yes | Verifies the keys without reading a secret. |
 | `dev info` | no | Resolved paths and effective config. |

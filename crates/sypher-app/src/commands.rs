@@ -40,6 +40,7 @@ pub fn dispatch(args: Cli) -> Result<ExitCode> {
         Command::Add(a) => cmd_add(&paths, a),
         Command::List(a) => cmd_list(&paths, a),
         Command::Delete(a) => cmd_delete(&paths, a),
+        Command::EnrollKey(a) => cmd_enroll_key(&paths, a.label),
         Command::Backup => cmd_backup(&paths),
         Command::Recovery(r) => cmd_recovery(&paths, r),
         Command::Restore(r) => cmd_restore(&paths, r),
@@ -126,10 +127,11 @@ fn cmd_add(paths: &VaultPaths, args: AddArgs) -> Result<ExitCode> {
 }
 
 fn cmd_list(paths: &VaultPaths, args: ListArgs) -> Result<ExitCode> {
-    // Listing is a metadata-only operation, so it deliberately does not
-    // unlock. The user should be able to see what they have without a touch.
-    let vault = Vault::open(paths).context("opening the vault")?;
-    let secrets = vault.list_meta().context("reading the vault")?;
+    // Metadata is now encrypted, so listing requires an unlock: there is no
+    // way to render names or sites without the inner key.
+    hw::warn_if_mock();
+    let mut session = open_unlocked(paths)?;
+    let secrets = session.list().context("reading the vault")?;
 
     if secrets.is_empty() {
         println!("The vault is empty. Add one with `sypherstore add <name>`.");
@@ -177,9 +179,12 @@ fn cmd_list(paths: &VaultPaths, args: ListArgs) -> Result<ExitCode> {
 }
 
 fn cmd_delete(paths: &VaultPaths, args: DeleteArgs) -> Result<ExitCode> {
-    let vault = Vault::open(paths).context("opening the vault")?;
-    let secrets = vault.list_meta()?;
-    let target = resolve_target(&secrets, &args.target)?;
+    // Metadata is encrypted, so resolving a target by name needs an unlock.
+    // The touch doubles as the reauthentication that deleting a row requires.
+    hw::warn_if_mock();
+    let mut session = open_unlocked(paths)?;
+    let secrets = session.list()?;
+    let target = resolve_target(&secrets, &args.target)?.clone();
 
     if !args.force {
         print!(
@@ -196,14 +201,42 @@ fn cmd_delete(paths: &VaultPaths, args: DeleteArgs) -> Result<ExitCode> {
         }
     }
 
-    // Deleting needs no key, so this path never asks for a touch.
-    let mut vault = Vault::open(paths)?;
-    vault.delete(&target.id).context("deleting the secret")?;
+    session.delete(&target.id).context("deleting the secret")?;
     // With secure_delete on, VACUUM rewrites the file so the removed
     // ciphertext does not survive in a free page.
-    vault.vacuum().context("compacting the vault")?;
+    session.vault().vacuum().context("compacting the vault")?;
 
     println!("Deleted {:?}", target.name);
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_enroll_key(paths: &VaultPaths, label: Option<String>) -> Result<ExitCode> {
+    hw::warn_if_mock();
+
+    // Enrolling a backup wraps the existing inner key under the new one, which
+    // means the primary must unlock the vault first: touch the key already
+    // enrolled, then present the new key.
+    println!("Unlock the vault with a key that is ALREADY enrolled.");
+    let mut session = open_unlocked(paths)?;
+
+    let existing = session.enrolled_labels().unwrap_or_default();
+    println!(
+        "This vault has {} enrolled key(s): {}.",
+        existing.len(),
+        if existing.is_empty() { "(none)".into() } else { existing.join(", ") }
+    );
+
+    if !hw::IS_MOCK {
+        println!("\nNow connect the NEW authenticator to enroll.");
+        println!("Touch it to register, then touch it again to derive its key.");
+    }
+    let label = label.unwrap_or_else(|| "backup".to_string());
+    session
+        .enroll_key(hw::inner(paths).as_ref(), &label)
+        .context("enrolling the new authenticator")?;
+
+    println!("Enrolled {label:?}. Either key can now unlock this vault.");
+    println!("Store the backup key somewhere separate from the primary.");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -299,7 +332,9 @@ fn cmd_recovery(paths: &VaultPaths, cmd: RecoveryCommand) -> Result<ExitCode> {
                 "the key was sealed, but the vault still will not open. \
                  The recovery key may belong to a different vault.",
             )?;
-            let count = session.list()?.len();
+            // Counting needs no key; the metadata itself stays sealed until a
+            // touch, which adopt deliberately does not require.
+            let count = session.vault().count()?;
 
             println!("Vault adopted on this machine. {count} secret(s) available.");
             println!("Touch your authenticator to use them: `sypherstore dev unlock-test`.");
@@ -419,7 +454,7 @@ fn cmd_dev(paths: &VaultPaths, cmd: DevCommand) -> Result<ExitCode> {
 
         DevCommand::UnlockTest => {
             hw::warn_if_mock();
-            let session = open_unlocked(paths)?;
+            let mut session = open_unlocked(paths)?;
             println!(
                 "Unlock succeeded and the verification blob decrypted. \
                  {} secret(s) in the vault.",

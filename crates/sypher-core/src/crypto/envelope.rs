@@ -45,7 +45,7 @@ use uuid::Uuid;
 use super::keys::{
     derive_secret_inner_key, derive_secret_outer_key, Key, KeyError,
 };
-use crate::model::{PayloadWire, SecretPayload};
+use crate::model::{MetaWire, PayloadWire, SecretMeta, SecretPayload};
 use crate::secure::SecureBuf;
 
 /// File magic, so a stray blob is identifiable outside the database.
@@ -257,6 +257,90 @@ pub fn open_payload(
     let wire: PayloadWire = ciborium::from_reader(cbor.as_slice())
         .map_err(|e| EnvelopeError::Decode(e.to_string()))?;
     Ok(wire.into_payload())
+}
+
+/// Domain string bound as AAD when wrapping `inner_kek`. Distinct from any
+/// secret's envelope so a wrap blob can never be mistaken for a payload.
+const WRAP_AAD: &[u8] = b"sypherstore/v1/inner-kek-wrap";
+
+/// Encrypts `inner_kek` under an authenticator's wrap key.
+///
+/// A single AEAD layer, not the double envelope: the wrap key is itself gated
+/// on a YubiKey touch, and the machine binding is provided separately by the
+/// TPM-sealed `outer_kek`, so wrapping here only needs to bind the plaintext to
+/// this authenticator. One wrapped copy is stored per enrolled key, which is
+/// what lets a backup YubiKey open the same vault.
+pub fn wrap_key(wrap_key: &Key, inner_kek: &Key) -> Result<Vec<u8>, EnvelopeError> {
+    let mut nonce = [0u8; NONCE_LEN];
+    getrandom::getrandom(&mut nonce)?;
+    let cipher = XChaCha20Poly1305::new(wrap_key.as_bytes().into());
+    let ct = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: inner_kek.as_bytes(),
+                aad: WRAP_AAD,
+            },
+        )
+        .map_err(|_| EnvelopeError::Decrypt)?;
+
+    let mut blob = Vec::with_capacity(NONCE_LEN + ct.len());
+    blob.extend_from_slice(&nonce);
+    blob.extend_from_slice(&ct);
+    Ok(blob)
+}
+
+/// Recovers `inner_kek` from a blob produced by [`wrap_key`].
+///
+/// A wrong wrap key (the wrong authenticator, or the right one against a
+/// different vault) fails the AEAD tag and returns [`EnvelopeError::Decrypt`].
+pub fn unwrap_key(wrap_key: &Key, blob: &[u8]) -> Result<Key, EnvelopeError> {
+    if blob.len() < NONCE_LEN + TAG_LEN {
+        return Err(EnvelopeError::Truncated(blob.len()));
+    }
+    let (nonce, ct) = blob.split_at(NONCE_LEN);
+    let cipher = XChaCha20Poly1305::new(wrap_key.as_bytes().into());
+    let mut plaintext = cipher
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload { msg: ct, aad: WRAP_AAD },
+        )
+        .map_err(|_| EnvelopeError::Decrypt)?;
+    let key = Key::take_from(&mut plaintext)?;
+    zeroize::Zeroize::zeroize(&mut plaintext);
+    Ok(key)
+}
+
+/// Encrypts a secret's searchable metadata into a storable blob.
+///
+/// Sealed to `meta_id`, a random UUID distinct from the secret's own id, so the
+/// metadata envelope and the payload envelope derive different subkeys and
+/// neither can be opened in the other's place.
+pub fn seal_meta(
+    meta_id: &Uuid,
+    inner_kek: &Key,
+    outer_kek: &Key,
+    meta: &SecretMeta,
+) -> Result<Vec<u8>, EnvelopeError> {
+    let wire = MetaWire::from_meta(meta);
+    let mut cbor = Vec::new();
+    ciborium::into_writer(&wire, &mut cbor)
+        .map_err(|e| EnvelopeError::Encode(e.to_string()))?;
+    seal_bytes(meta_id, inner_kek, outer_kek, &cbor)
+}
+
+/// Decrypts a metadata blob, reattaching the plaintext row `id`.
+pub fn open_meta(
+    meta_id: &Uuid,
+    id: &Uuid,
+    inner_kek: &Key,
+    outer_kek: &Key,
+    blob: &[u8],
+) -> Result<SecretMeta, EnvelopeError> {
+    let cbor = open_bytes(meta_id, inner_kek, outer_kek, blob)?;
+    let wire: MetaWire = ciborium::from_reader(cbor.as_slice())
+        .map_err(|e| EnvelopeError::Decode(e.to_string()))?;
+    Ok(wire.into_meta(*id))
 }
 
 /// Builds the vault's verification blob. Stored in `meta` at init.
@@ -506,6 +590,45 @@ mod tests {
 
         let bad_inner = Key::from_slice(&[0xEE; 32]).unwrap();
         assert!(verify_keys(&id, &bad_inner, &outer, &blob).is_err());
+    }
+
+    #[test]
+    fn inner_key_wraps_and_unwraps() {
+        let wrap = Key::from_slice(&[7u8; 32]).unwrap();
+        let inner = Key::from_slice(&[0x5A; 32]).unwrap();
+        let blob = wrap_key(&wrap, &inner).unwrap();
+
+        assert_eq!(unwrap_key(&wrap, &blob).unwrap(), inner);
+        // The wrapped inner key must not appear verbatim in the blob.
+        assert!(!blob.windows(32).any(|w| w == inner.as_bytes()));
+    }
+
+    #[test]
+    fn a_wrong_wrap_key_cannot_unwrap() {
+        let wrap = Key::from_slice(&[7u8; 32]).unwrap();
+        let inner = Key::from_slice(&[0x5A; 32]).unwrap();
+        let blob = wrap_key(&wrap, &inner).unwrap();
+
+        let wrong = Key::from_slice(&[8u8; 32]).unwrap();
+        assert!(matches!(
+            unwrap_key(&wrong, &blob),
+            Err(EnvelopeError::Decrypt)
+        ));
+    }
+
+    #[test]
+    fn two_wrap_keys_yield_the_same_inner_key() {
+        // The backup-key property: two enrolled authenticators hold two wrapped
+        // copies that both recover the one inner key.
+        let inner = Key::from_slice(&[0x5A; 32]).unwrap();
+        let primary = Key::from_slice(&[1u8; 32]).unwrap();
+        let backup = Key::from_slice(&[2u8; 32]).unwrap();
+
+        let blob_a = wrap_key(&primary, &inner).unwrap();
+        let blob_b = wrap_key(&backup, &inner).unwrap();
+
+        assert_eq!(unwrap_key(&primary, &blob_a).unwrap(), inner);
+        assert_eq!(unwrap_key(&backup, &blob_b).unwrap(), inner);
     }
 
     #[test]

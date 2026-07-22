@@ -11,12 +11,12 @@ from ciphertext to plaintext; the rest of the crate is components it uses.
 | Module | Responsibility |
 | --- | --- |
 | `secure` | `SecureBuf`: mlocked, zeroize-on-drop, redacted-`Debug` byte buffer. Every plaintext byte lives in one. |
-| `crypto::keys` | Key hierarchy (`outer_kek`, `inner_kek`, per-secret subkeys) and the two hardware provider traits. |
-| `crypto::envelope` | The double-encryption envelope: format, seal, open, verification blob. |
-| `model` | `SecretMeta` (cleartext, searchable) and `SecretPayload` (encrypted). The split is a safety property, not organization. |
-| `vault::db` | SQLite storage. Never decrypts; stores opaque blobs. |
+| `crypto::keys` | Key hierarchy (`outer_kek`, random `inner_kek` wrapped per enrolled key, per-secret subkeys) and the two hardware provider traits. |
+| `crypto::envelope` | The double-encryption envelope: format, seal, open, metadata seal, inner-key wrap, verification blob. |
+| `model` | `SecretMeta` (searchable, now also sealed) and `SecretPayload` (encrypted). The split is a safety property, not organization. |
+| `vault::db` | SQLite storage. Never decrypts; each row is two opaque sealed blobs plus two random UUIDs. |
 | `vault::paths` | Vault location resolution and owner-only atomic writes. |
-| `vault::session` | Lock state machine and CRUD. Enforces "both keys or no plaintext". |
+| `vault::session` | Lock state machine, CRUD, and authenticator enrollment. Enforces "both keys or no plaintext". |
 | `search::domain` | Hostname normalization and PSL-based domain matching. |
 | `search::fuzzy` | Ranking for the popup. Metadata only. |
 | `config` | Non-secret JSON configuration. |

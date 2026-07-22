@@ -14,11 +14,11 @@
 //!
 //! ## What it can and cannot do
 //!
-//! The list renders from metadata alone, so it appears fully populated while
-//! the vault is still locked. Only *using* an entry needs the inner key. That
-//! ordering is deliberate: the user sees their options, then decides whether
-//! the touch is worth it, instead of being asked to authenticate before they
-//! know what they will get.
+//! Metadata is now encrypted, so the list cannot be shown until the vault is
+//! unlocked. While locked the popup displays a prompt to touch the YubiKey; the
+//! daemon decrypts the list only after a successful unlock and pushes it in via
+//! a `Refresh`. This is a deliberate reversal of the earlier "instant list"
+//! design: nothing about the user's accounts is revealed before authentication.
 //!
 //! ## Keyboard first, but not keyboard only
 //!
@@ -436,6 +436,27 @@ impl Popup {
     }
 
     fn draw_list(&mut self, ui: &mut egui::Ui) {
+        // While locked the daemon sends no metadata (it is encrypted), so an
+        // empty list means "not unlocked yet", not "empty vault". Say so rather
+        // than showing a bare, misleading blank.
+        if self.ranked.is_empty() && !self.lock_state.is_unlocked() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(40.0);
+                let (msg, color) = match self.lock_state {
+                    UiLockState::WaitingForTouch => (
+                        "Touch your YubiKey, then enter its PIN, to reveal your secrets.",
+                        egui::Color32::from_rgb(0xE5, 0xC0, 0x7B),
+                    ),
+                    _ => (
+                        "Locked. Touch your YubiKey to reveal your secrets.",
+                        egui::Color32::from_rgb(0xE0, 0x6C, 0x75),
+                    ),
+                };
+                ui.colored_label(color, msg);
+            });
+            return;
+        }
+
         if self.ranked.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
@@ -726,8 +747,15 @@ impl Popup {
                 egui::Color32::from_rgb(0xE0, 0x6C, 0x75),
                 "This cannot be undone.",
             );
-            ui.add_space(24.0);
-            ui.weak("Enter to delete    Esc to cancel");
+            ui.add_space(10.0);
+            // Deleting demands a fresh authentication, so say so before the user
+            // commits rather than surprising them with a blinking key.
+            ui.colored_label(
+                egui::Color32::from_rgb(0xE5, 0xC0, 0x7B),
+                "You will need to touch your YubiKey and enter its PIN to confirm.",
+            );
+            ui.add_space(20.0);
+            ui.weak("Enter: confirm (then touch your key)    Esc: cancel");
         });
     }
 

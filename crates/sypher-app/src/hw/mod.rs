@@ -26,10 +26,9 @@ pub fn outer(paths: &VaultPaths) -> Box<dyn OuterKeyProvider> {
 
 /// The presence-bound inner provider for this build.
 ///
-/// Wired with a terminal PIN prompt. Authenticators with a PIN set refuse
-/// hmac-secret without user verification, so without this the vault could not
-/// be opened at all on such a device. The prompt only fires if the device
-/// actually demands it.
+/// Wired with a terminal PIN prompt. A PIN is now required on every operation,
+/// not only when the device demands it, so this prompt fires each time the
+/// authenticator is used from the CLI.
 #[cfg(not(feature = "mock-hw"))]
 pub fn inner(_paths: &VaultPaths) -> Box<dyn InnerKeyProvider> {
     Box::new(fido::FidoInnerProvider::with_pin_prompt(std::sync::Arc::new(

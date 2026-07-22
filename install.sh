@@ -248,7 +248,9 @@ if [[ -f "$VAULT_DIR/vault.db" ]]; then
     NEW_VAULT=false
 else
     bold "Creating a new vault. Touch your authenticator when it blinks."
-    info "This takes two touches: one to register, one to derive the key."
+    info "This takes two touches, and your authenticator's PIN: one to"
+    info "register the credential, one to derive its key. A PIN must be set"
+    info "on the authenticator; it is required on every unlock from now on."
     echo
     "$BIN_DIR/sypherstore" init
     NEW_VAULT=true
@@ -309,7 +311,8 @@ register the shortcut, and the first paste asks for permission to type.
 
 Useful commands:
   sypherstore add <name>        store a secret
-  sypherstore list              show what is in the vault (no touch needed)
+  sypherstore list              show what is in the vault (unlocks; metadata is encrypted)
+  sypherstore enroll-key        enroll a backup YubiKey so a lost primary does not lose the vault
   sypherstore backup            encrypted snapshot into the vault directory
   sypherstore doctor            re-check this machine
   sypherstore recovery export   print the recovery key again
@@ -321,4 +324,6 @@ EOF
 if [[ "${NEW_VAULT:-false}" == true ]]; then
     echo
     bold "Reminder: without the recovery key, losing this machine loses the vault."
+    bold "And without a backup YubiKey, losing your authenticator loses the vault."
+    info "Enroll a second key now with: sypherstore enroll-key"
 fi

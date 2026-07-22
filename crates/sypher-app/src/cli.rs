@@ -51,11 +51,18 @@ pub enum Command {
     /// Add a secret.
     Add(AddArgs),
 
-    /// List stored secrets. Shows metadata only; no touch required.
+    /// List stored secrets. Metadata is encrypted, so this unlocks the vault
+    /// and requires a touch.
     List(ListArgs),
 
-    /// Delete a secret by id or exact name.
+    /// Delete a secret by id or exact name. Requires a touch.
     Delete(DeleteArgs),
+
+    /// Enroll a backup authenticator so it can also open this vault.
+    ///
+    /// Unlock with a key that is already enrolled, then present the new key.
+    /// Both keys will open the vault afterwards.
+    EnrollKey(EnrollKeyArgs),
 
     /// Write an encrypted snapshot of the vault.
     ///
@@ -132,6 +139,13 @@ pub struct DeleteArgs {
     /// Skip the confirmation prompt.
     #[arg(long, short)]
     pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct EnrollKeyArgs {
+    /// A label for the new key, e.g. "backup" or "travel".
+    #[arg(long)]
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]

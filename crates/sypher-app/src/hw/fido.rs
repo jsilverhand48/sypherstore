@@ -21,6 +21,20 @@
 //! particular key exposes only the FIDO interface over USB (`1050:0402`), so
 //! PIV/CCID is not available. hmac-secret is the right primitive regardless.
 //!
+//! ## A PIN is always required
+//!
+//! Every operation runs with user verification: the authenticator's PIN is
+//! requested and passed on registration and on every unlock. This is a
+//! deliberate second factor on top of the touch, so that a stolen-and-plugged
+//! key alone cannot unlock the vault without also knowing the PIN. A key with
+//! no PIN set therefore cannot be used, which is intended.
+//!
+//! ## More than one enrolled key
+//!
+//! Unlock passes every enrolled credential in the assertion's allow-list, so
+//! whichever key is present answers with a single touch and reports which
+//! credential it used. That is how a backup YubiKey opens the same vault.
+//!
 //! ## What an attacker with the vault but not the key can do
 //!
 //! Nothing. The inner ciphertext is sealed under a key derived from the
@@ -151,41 +165,20 @@ impl InnerKeyProvider for FidoInnerProvider {
             Some(RP_NAME),
         );
 
-        // Non-resident: the credential id is stored in our vault rather than
-        // consuming one of the authenticator's limited resident-key slots.
-        //
-        // The builder borrows the PIN, so the two attempts are written out
-        // rather than shared through a closure, which cannot outlive its
-        // argument.
-        //
-        // Try without user verification first, so a device with no PIN is
-        // never asked for one. YubiKeys with a PIN set refuse hmac-secret
-        // without UV, and that refusal is what tells us to escalate.
-        let first = device.make_credential_with_args(
-            &MakeCredentialArgsBuilder::new(RP_ID, CHALLENGE)
-                .extensions(&[CredentialExtension::HmacSecret(Some(true))])
-                .user_entity(&user)
-                .without_pin_and_uv()
-                .build(),
-        );
-
-        let attestation = match first {
-            Ok(a) => a,
-            Err(e) if needs_user_verification(&e) => {
-                tracing::debug!("authenticator requires user verification; requesting the PIN");
-                let pin = self.request_pin()?;
-                device
-                    .make_credential_with_args(
-                        &MakeCredentialArgsBuilder::new(RP_ID, CHALLENGE)
-                            .extensions(&[CredentialExtension::HmacSecret(Some(true))])
-                            .user_entity(&user)
-                            .pin(&pin)
-                            .build(),
-                    )
-                    .map_err(map_device_error)?
-            }
-            Err(e) => return Err(map_device_error(e)),
-        };
+        // A PIN is mandatory for this vault, so obtain it up front and register
+        // the credential with user verification. Non-resident: the credential
+        // id is stored in our vault rather than consuming one of the
+        // authenticator's limited resident-key slots.
+        let pin = self.request_pin()?;
+        let attestation = device
+            .make_credential_with_args(
+                &MakeCredentialArgsBuilder::new(RP_ID, CHALLENGE)
+                    .extensions(&[CredentialExtension::HmacSecret(Some(true))])
+                    .user_entity(&user)
+                    .pin(&pin)
+                    .build(),
+            )
+            .map_err(map_device_error)?;
 
         // The authenticator must confirm it actually enabled hmac-secret. If
         // it silently ignored the extension, every later assertion would
@@ -220,51 +213,58 @@ impl InnerKeyProvider for FidoInnerProvider {
     }
 
     fn assert_secret(&self, credential_id: &[u8], salt: &[u8]) -> Result<SecureBuf, ProviderError> {
-        if salt.len() != HMAC_LEN {
-            return Err(ProviderError::Device(format!(
-                "the hmac-secret salt must be {HMAC_LEN} bytes, got {}",
-                salt.len()
-            )));
+        // A single known credential is just an allow-list of one.
+        let (_, secret) = self.assert_first_available(&[credential_id.to_vec()], salt)?;
+        Ok(secret)
+    }
+
+    fn assert_first_available(
+        &self,
+        credential_ids: &[Vec<u8>],
+        salt: &[u8],
+    ) -> Result<(Vec<u8>, SecureBuf), ProviderError> {
+        let salt = check_salt(salt)?;
+        if credential_ids.is_empty() {
+            return Err(ProviderError::NoDevice(
+                "this vault has no enrolled authenticators".into(),
+            ));
         }
-        let salt: [u8; HMAC_LEN] = salt
-            .try_into()
-            .map_err(|_| ProviderError::Device("malformed hmac-secret salt".into()))?;
 
         let device = self.open()?;
 
-        let first = device.get_assertion_with_args(
-            &GetAssertionArgsBuilder::new(RP_ID, CHALLENGE)
-                .credential_id(credential_id)
-                .extensions(&[AssertionExtension::HmacSecret(Some(salt))])
-                .without_pin_and_uv()
-                .build(),
-        );
-
-        let assertions = match first {
-            Ok(a) => a,
-            Err(e) if needs_user_verification(&e) => {
-                tracing::debug!("authenticator requires user verification; requesting the PIN");
-                let pin = self.request_pin()?;
-                device
-                    .get_assertion_with_args(
-                        &GetAssertionArgsBuilder::new(RP_ID, CHALLENGE)
-                            .credential_id(credential_id)
-                            .extensions(&[AssertionExtension::HmacSecret(Some(salt))])
-                            .pin(&pin)
-                            .build(),
-                    )
-                    .map_err(map_device_error)?
-            }
-            Err(e) => return Err(map_device_error(e)),
-        };
+        // PIN is required on every unlock. One request, one touch: every
+        // enrolled credential goes in the allow-list and the authenticator
+        // answers for whichever it holds.
+        let pin = self.request_pin()?;
+        let mut builder = GetAssertionArgsBuilder::new(RP_ID, CHALLENGE)
+            .extensions(&[AssertionExtension::HmacSecret(Some(salt))])
+            .pin(&pin);
+        for id in credential_ids {
+            builder = builder.add_credential_id(id);
+        }
+        let assertions = device
+            .get_assertion_with_args(&builder.build())
+            .map_err(map_device_error)?;
 
         let assertion = assertions.first().ok_or_else(|| {
             ProviderError::Device(
-                "the authenticator returned no assertion. The credential may have been \
-                 deleted, or this is a different authenticator than the vault was created with."
+                "the authenticator returned no assertion. It is not one of the keys enrolled \
+                 in this vault, or its credential was deleted."
                     .into(),
             )
         })?;
+
+        // The authenticator reports which credential it used. Some omit it when
+        // the allow-list held exactly one, in which case that one is implied.
+        let matched = if !assertion.credential_id.is_empty() {
+            assertion.credential_id.clone()
+        } else if credential_ids.len() == 1 {
+            credential_ids[0].clone()
+        } else {
+            return Err(ProviderError::Device(
+                "the authenticator did not say which credential it used".into(),
+            ));
+        };
 
         for extension in &assertion.extensions {
             if let AssertionExtension::HmacSecret(Some(output)) = extension {
@@ -278,7 +278,7 @@ impl InnerKeyProvider for FidoInnerProvider {
                 let mut raw = output.to_vec();
                 let secret = SecureBuf::take_from(&mut raw);
                 tracing::debug!("hmac-secret assertion succeeded");
-                return Ok(secret);
+                return Ok((matched, secret));
             }
         }
 
@@ -290,24 +290,15 @@ impl InnerKeyProvider for FidoInnerProvider {
     }
 }
 
-/// Whether the authenticator refused because it wants user verification.
-///
-/// Deliberately does **not** match `CTAP2_ERR_OPERATION_DENIED` (0x27).
-/// That code was initially assumed to mean "PIN required", but observation
-/// showed a YubiKey returns it when the user simply does not touch the sensor
-/// in time. Treating it as a PIN requirement would greet anyone with a slow
-/// finger with a spurious PIN prompt for a key that has no PIN, which is both
-/// confusing and trains the user to type their PIN when nothing asked for it.
-///
-/// Only codes that unambiguously mean "verification is missing" escalate.
-fn needs_user_verification(error: &impl std::fmt::Display) -> bool {
-    let text = error.to_string().to_ascii_lowercase();
-    text.contains("pin_required")
-        || text.contains("pin required")
-        || text.contains("uv_required")
-        || text.contains("puat_required")
-        || text.contains("unauthorized_permission")
-        || text.contains("pin_not_set")
+/// Validates and copies the hmac-secret salt, rejecting a wrong length before
+/// any hardware is touched.
+fn check_salt(salt: &[u8]) -> Result<[u8; HMAC_LEN], ProviderError> {
+    salt.try_into().map_err(|_| {
+        ProviderError::Device(format!(
+            "the hmac-secret salt must be {HMAC_LEN} bytes, got {}",
+            salt.len()
+        ))
+    })
 }
 
 /// Turns a library error into something a user can act on.
@@ -356,24 +347,11 @@ mod tests {
     }
 
     #[test]
-    fn only_genuine_verification_failures_escalate_to_a_pin() {
-        assert!(needs_user_verification(&"CTAP2_ERR_PIN_REQUIRED"));
-        assert!(needs_user_verification(&"CTAP2_ERR_UNAUTHORIZED_PERMISSION"));
-        assert!(!needs_user_verification(&"CTAP1_ERR_TIMEOUT"));
-        assert!(!needs_user_verification(&"some unrelated failure"));
-    }
-
-    #[test]
-    fn an_untouched_sensor_is_not_mistaken_for_a_pin_requirement() {
+    fn an_untouched_sensor_reads_as_a_cancellation_not_a_pin_problem() {
         // This exact string came from a real YubiKey when the sensor was not
-        // touched in time. Escalating on it would prompt for a PIN that the
-        // key does not even have.
+        // touched in time. It must map to a cancellation, not a PIN error.
         let untouched = "response_status err = 0x27 CTAP2_ERR_OPERATION_DENIED  Not authorized \
                          for requested operation.";
-        assert!(
-            !needs_user_verification(&untouched),
-            "a missed touch must not trigger a PIN prompt"
-        );
         assert!(matches!(
             map_device_error(untouched),
             ProviderError::Cancelled
@@ -382,6 +360,8 @@ mod tests {
 
     #[test]
     fn without_a_prompt_a_pin_requirement_is_explained_not_hidden() {
+        // A PIN is now mandatory, so a provider with no way to ask for one must
+        // say so rather than proceeding.
         let provider = FidoInnerProvider::new();
         let err = provider.request_pin().unwrap_err();
         assert!(
@@ -400,6 +380,15 @@ mod tests {
             matches!(err, ProviderError::Device(m) if m.contains("32 bytes")),
             "expected a salt length complaint"
         );
+    }
+
+    #[test]
+    fn an_empty_allow_list_is_refused_before_touching_hardware() {
+        let provider = FidoInnerProvider::new();
+        let err = provider
+            .assert_first_available(&[], &[0u8; HMAC_LEN])
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::NoDevice(_)));
     }
 
     #[test]

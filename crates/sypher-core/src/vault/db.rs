@@ -1,17 +1,18 @@
 //! SQLite-backed vault storage.
 //!
-//! The database holds two very different kinds of data and treats them
-//! differently:
+//! The database is now a pure blob store. Every row holds two opaque sealed
+//! envelopes and nothing else readable:
 //!
-//! - **Metadata** (name, domain, application, username, tags) is stored in the
-//!   clear. This is what makes the popup instant: the list can be rendered and
-//!   searched with no inner key and therefore no touch. The tradeoff is
-//!   explicit in the threat model, an attacker with the file learns which
-//!   sites you have accounts on but not a single credential.
-//! - **`encrypted_blob`** is the double-sealed envelope. The database layer
-//!   never decrypts; it stores and returns opaque bytes. Keeping the store
-//!   ignorant of the crypto means no query path can accidentally return
-//!   plaintext.
+//! - **`meta_blob`** seals the searchable metadata (name, domain, application,
+//!   username, tags). It used to be plaintext columns; encrypting it is what
+//!   makes an attacker with `vault.db` unable to learn which accounts you hold.
+//! - **`payload_blob`** seals the secret value and notes.
+//!
+//! The database layer never decrypts; it stores and returns opaque bytes and
+//! two plaintext UUIDs (the row id and the metadata envelope's id, both
+//! random). Keeping the store ignorant of the crypto means no query path can
+//! return plaintext, and the list can only be built by a caller that holds the
+//! inner key.
 //!
 //! `secure_delete` is on so that overwritten and deleted rows do not linger in
 //! free pages, which is what makes `strings vault.db` come up empty after a
@@ -20,23 +21,41 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
-use crate::model::{now_unix, SecretMeta, SecretType};
 use crate::vault::paths::{set_owner_only, VaultPaths};
 
 /// Current schema version. Bumping this requires a matching arm in
 /// [`Vault::migrate`].
-const SCHEMA_VERSION: i64 = 1;
+///
+/// v2 removed every plaintext metadata column in favour of a single sealed
+/// `meta_blob`, and dropped the tag tables (tags now live inside that blob).
+/// There is no in-place upgrade from v1: the metadata was never encrypted, so
+/// a v1 vault must be re-initialized.
+const SCHEMA_VERSION: i64 = 2;
 
 /// Meta table key holding the per-vault KDF salt (hex).
 pub const META_KDF_SALT: &str = "kdf_salt";
-/// Meta table key holding the FIDO2 credential id (hex).
-pub const META_CREDENTIAL_ID: &str = "fido_credential_id";
-/// Meta table key holding the FIDO2 hmac salt (hex).
+/// Meta table key holding the per-vault FIDO2 hmac salt (hex).
+///
+/// One salt for the whole vault, so a single assertion carrying every enrolled
+/// credential in its allow-list resolves which key is present in one touch.
 pub const META_HMAC_SALT: &str = "fido_hmac_salt";
+/// Meta table key holding the CBOR list of enrolled authenticators (hex).
+pub const META_ENROLLMENTS: &str = "fido_enrollments";
 /// Meta table key holding the verification envelope (hex).
 pub const META_VERIFY_BLOB: &str = "verify_blob";
 /// Meta table key holding the UUID the verification envelope is bound to.
 pub const META_VERIFY_ID: &str = "verify_id";
+
+/// One stored row: the two plaintext UUIDs and the sealed metadata.
+///
+/// The payload blob is deliberately absent; it is fetched only for the single
+/// secret a caller chooses to open, never for the whole list.
+#[derive(Debug, Clone)]
+pub struct SecretRow {
+    pub id: Uuid,
+    pub meta_id: Uuid,
+    pub meta_blob: Vec<u8>,
+}
 
 pub struct Vault {
     conn: Connection,
@@ -48,6 +67,12 @@ pub enum VaultError {
     NotFound(Uuid),
     #[error("vault is not initialized: {0} is missing")]
     NotInitialized(String),
+    #[error(
+        "this vault uses the old pre-encryption format, which cannot be upgraded \
+         in place (its metadata was stored in the clear). Back up anything you \
+         need, delete the vault directory, and run `sypherstore init` again."
+    )]
+    IncompatibleSchema,
     #[error("vault metadata key {0:?} is missing or malformed")]
     BadMeta(String),
     #[error("a secret named {0:?} already exists")]
@@ -103,45 +128,43 @@ impl Vault {
             return Ok(());
         }
 
-        if current < 1 {
-            self.conn.execute_batch(
-                r#"
-                CREATE TABLE IF NOT EXISTS meta (
-                    key   TEXT PRIMARY KEY NOT NULL,
-                    value TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS secrets (
-                    id             TEXT PRIMARY KEY NOT NULL,
-                    name           TEXT NOT NULL,
-                    domain         TEXT NOT NULL DEFAULT '',
-                    application    TEXT NOT NULL DEFAULT '',
-                    type           TEXT NOT NULL,
-                    username       TEXT NOT NULL DEFAULT '',
-                    encrypted_blob BLOB NOT NULL,
-                    created_at     INTEGER NOT NULL,
-                    updated_at     INTEGER NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS tags (
-                    id   INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL UNIQUE
-                );
-
-                CREATE TABLE IF NOT EXISTS secret_tags (
-                    secret_id TEXT NOT NULL
-                        REFERENCES secrets(id) ON DELETE CASCADE,
-                    tag_id    INTEGER NOT NULL
-                        REFERENCES tags(id) ON DELETE CASCADE,
-                    PRIMARY KEY (secret_id, tag_id)
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_secrets_domain ON secrets(domain);
-                CREATE INDEX IF NOT EXISTS idx_secrets_application ON secrets(application);
-                CREATE INDEX IF NOT EXISTS idx_secret_tags_tag ON secret_tags(tag_id);
-                "#,
-            )?;
+        // Refuse to open a v1 (pre-encryption) database rather than silently
+        // corrupting it. v1 held metadata in plaintext columns this schema has
+        // dropped; `CREATE TABLE IF NOT EXISTS` would leave the old shape in
+        // place and every later query would fail against missing columns.
+        let has_secrets: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='secrets'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if has_secrets > 0
+            && self.conn.prepare("SELECT meta_id FROM secrets LIMIT 0").is_err()
+        {
+            return Err(VaultError::IncompatibleSchema);
         }
+
+        // v2 is the first encrypted-metadata schema. A v1 database predates
+        // metadata encryption and cannot be upgraded in place (there is no key
+        // available here to re-seal its plaintext columns), so a fresh vault is
+        // created and the old one must be re-initialized.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS secrets (
+                id           TEXT PRIMARY KEY NOT NULL,
+                meta_id      TEXT NOT NULL,
+                meta_blob    BLOB NOT NULL,
+                payload_blob BLOB NOT NULL
+            );
+            "#,
+        )?;
 
         self.conn
             .pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -193,68 +216,45 @@ impl Vault {
 
     // ---- secrets --------------------------------------------------------
 
-    /// Inserts a new secret with its sealed blob.
-    pub fn insert(&mut self, meta: &SecretMeta, blob: &[u8]) -> Result<(), VaultError> {
-        let tx = self.conn.transaction()?;
-        tx.execute(
-            "INSERT INTO secrets
-                (id, name, domain, application, type, username,
-                 encrypted_blob, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                meta.id.to_string(),
-                meta.name,
-                meta.domain,
-                meta.application,
-                meta.secret_type.as_str(),
-                meta.username,
-                blob,
-                meta.created_at,
-                meta.updated_at,
-            ],
+    /// Inserts a new secret from its two sealed envelopes.
+    ///
+    /// The database sees only opaque bytes and the two plaintext UUIDs; the
+    /// caller ([`crate::vault::session::Session`]) does the sealing.
+    pub fn insert_row(
+        &mut self,
+        id: &Uuid,
+        meta_id: &Uuid,
+        meta_blob: &[u8],
+        payload_blob: &[u8],
+    ) -> Result<(), VaultError> {
+        self.conn.execute(
+            "INSERT INTO secrets (id, meta_id, meta_blob, payload_blob)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id.to_string(), meta_id.to_string(), meta_blob, payload_blob],
         )?;
-        set_tags(&tx, &meta.id, &meta.tags)?;
-        tx.commit()?;
         Ok(())
     }
 
-    /// Replaces a secret's metadata and blob, bumping `updated_at`.
-    ///
-    /// The blob is required rather than optional because any metadata edit
-    /// that changes the UUID-bound envelope would invalidate it; callers
-    /// re-seal after a fresh assertion, which is what `confirm_on_edit`
-    /// enforces at the UI layer.
-    pub fn update(&mut self, meta: &SecretMeta, blob: &[u8]) -> Result<(), VaultError> {
-        let tx = self.conn.transaction()?;
-        let changed = tx.execute(
-            "UPDATE secrets SET
-                name = ?2, domain = ?3, application = ?4, type = ?5,
-                username = ?6, encrypted_blob = ?7, updated_at = ?8
+    /// Replaces an existing secret's sealed envelopes.
+    pub fn update_row(
+        &mut self,
+        id: &Uuid,
+        meta_id: &Uuid,
+        meta_blob: &[u8],
+        payload_blob: &[u8],
+    ) -> Result<(), VaultError> {
+        let changed = self.conn.execute(
+            "UPDATE secrets SET meta_id = ?2, meta_blob = ?3, payload_blob = ?4
              WHERE id = ?1",
-            params![
-                meta.id.to_string(),
-                meta.name,
-                meta.domain,
-                meta.application,
-                meta.secret_type.as_str(),
-                meta.username,
-                blob,
-                now_unix(),
-            ],
+            params![id.to_string(), meta_id.to_string(), meta_blob, payload_blob],
         )?;
         if changed == 0 {
-            return Err(VaultError::NotFound(meta.id));
+            return Err(VaultError::NotFound(*id));
         }
-        tx.execute(
-            "DELETE FROM secret_tags WHERE secret_id = ?1",
-            params![meta.id.to_string()],
-        )?;
-        set_tags(&tx, &meta.id, &meta.tags)?;
-        tx.commit()?;
         Ok(())
     }
 
-    /// Deletes a secret and its tag links.
+    /// Deletes a secret.
     pub fn delete(&mut self, id: &Uuid) -> Result<(), VaultError> {
         let changed = self
             .conn
@@ -262,62 +262,69 @@ impl Vault {
         if changed == 0 {
             return Err(VaultError::NotFound(*id));
         }
-        // Tag rows cascade, but a tag with no remaining secrets would keep
-        // appearing in the tag filter, so prune orphans.
-        self.conn.execute(
-            "DELETE FROM tags WHERE id NOT IN (SELECT tag_id FROM secret_tags)",
-            [],
-        )?;
         Ok(())
     }
 
-    /// Returns every secret's metadata, newest-updated first.
+    /// Returns every row's sealed metadata for the caller to decrypt.
     ///
-    /// This is the popup's data source. It deliberately does not read
-    /// `encrypted_blob`: loading megabytes of ciphertext to render a list
-    /// would be wasteful, and not having it in hand makes it impossible to
-    /// decrypt something the user did not select.
-    pub fn list_meta(&self) -> Result<Vec<SecretMeta>, VaultError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, domain, application, type, username, created_at, updated_at
-             FROM secrets ORDER BY updated_at DESC",
-        )?;
+    /// Order is unspecified: the caller decrypts and sorts, because the sort
+    /// key (`updated_at`) lives inside the sealed blob. The payload blobs are
+    /// not read, so building the list never pulls megabytes of ciphertext.
+    pub fn list_rows(&self) -> Result<Vec<SecretRow>, VaultError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, meta_id, meta_blob FROM secrets")?;
         let rows = stmt.query_map([], |r| {
-            let id_str: String = r.get(0)?;
-            Ok(SecretMeta {
-                id: Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::nil()),
-                name: r.get(1)?,
-                domain: r.get(2)?,
-                application: r.get(3)?,
-                secret_type: SecretType::from_str_lenient(&r.get::<_, String>(4)?),
-                username: r.get(5)?,
-                tags: Vec::new(),
-                created_at: r.get(6)?,
-                updated_at: r.get(7)?,
-            })
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+            ))
         })?;
 
-        let mut out: Vec<SecretMeta> = rows.collect::<Result<_, _>>()?;
-        self.attach_tags(&mut out)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, meta_id, meta_blob) = row?;
+            out.push(SecretRow {
+                id: Uuid::parse_str(&id).unwrap_or_else(|_| Uuid::nil()),
+                meta_id: Uuid::parse_str(&meta_id).unwrap_or_else(|_| Uuid::nil()),
+                meta_blob,
+            });
+        }
         Ok(out)
     }
 
-    /// Reads one secret's metadata.
-    pub fn get_meta_for(&self, id: &Uuid) -> Result<SecretMeta, VaultError> {
-        self.list_meta()?
-            .into_iter()
-            .find(|m| m.id == *id)
+    /// Reads one row's sealed metadata.
+    pub fn get_meta_row(&self, id: &Uuid) -> Result<SecretRow, VaultError> {
+        self.conn
+            .query_row(
+                "SELECT id, meta_id, meta_blob FROM secrets WHERE id = ?1",
+                params![id.to_string()],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(id, meta_id, meta_blob)| SecretRow {
+                id: Uuid::parse_str(&id).unwrap_or_else(|_| Uuid::nil()),
+                meta_id: Uuid::parse_str(&meta_id).unwrap_or_else(|_| Uuid::nil()),
+                meta_blob,
+            })
             .ok_or(VaultError::NotFound(*id))
     }
 
-    /// Reads one secret's sealed blob.
+    /// Reads one secret's sealed payload blob.
     ///
-    /// Separate from metadata so that ciphertext is only ever fetched for the
-    /// single secret the user chose to use.
+    /// Separate from metadata so that the payload ciphertext is only ever
+    /// fetched for the single secret the user chose to use.
     pub fn get_blob(&self, id: &Uuid) -> Result<Vec<u8>, VaultError> {
         self.conn
             .query_row(
-                "SELECT encrypted_blob FROM secrets WHERE id = ?1",
+                "SELECT payload_blob FROM secrets WHERE id = ?1",
                 params![id.to_string()],
                 |r| r.get(0),
             )
@@ -325,82 +332,20 @@ impl Vault {
             .ok_or(VaultError::NotFound(*id))
     }
 
-    /// Number of stored secrets.
+    /// Number of stored secrets. Needs no key, so callers can report a count
+    /// without unlocking.
     pub fn count(&self) -> Result<i64, VaultError> {
         Ok(self
             .conn
             .query_row("SELECT COUNT(*) FROM secrets", [], |r| r.get(0))?)
     }
 
-    /// Every tag in use, alphabetically.
-    pub fn all_tags(&self) -> Result<Vec<String>, VaultError> {
-        let mut stmt = self.conn.prepare("SELECT name FROM tags ORDER BY name")?;
-        let rows = stmt.query_map([], |r| r.get(0))?;
-        Ok(rows.collect::<Result<_, _>>()?)
-    }
-
-    /// Fills in the `tags` field on each metadata record.
-    ///
-    /// Done as one query over all secrets rather than one per secret, since
-    /// the popup loads the full list on every hotkey press.
-    fn attach_tags(&self, metas: &mut [SecretMeta]) -> Result<(), VaultError> {
-        if metas.is_empty() {
-            return Ok(());
-        }
-        let mut stmt = self.conn.prepare(
-            "SELECT st.secret_id, t.name
-             FROM secret_tags st JOIN tags t ON t.id = st.tag_id
-             ORDER BY t.name",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
-
-        let mut by_id: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
-        for row in rows {
-            let (secret_id, tag) = row?;
-            by_id.entry(secret_id).or_default().push(tag);
-        }
-        for m in metas.iter_mut() {
-            if let Some(tags) = by_id.remove(&m.id.to_string()) {
-                m.tags = tags;
-            }
-        }
-        Ok(())
-    }
-
     /// Runs `VACUUM`, which with `secure_delete` rewrites the file and drops
-    /// any residual freed pages. Called after bulk deletes.
+    /// any residual freed pages. Called after deletes.
     pub fn vacuum(&self) -> Result<(), VaultError> {
         self.conn.execute_batch("VACUUM")?;
         Ok(())
     }
-}
-
-/// Interns tag names and links them to a secret.
-fn set_tags(tx: &rusqlite::Transaction<'_>, id: &Uuid, tags: &[String]) -> Result<(), VaultError> {
-    for tag in tags {
-        let tag = tag.trim();
-        if tag.is_empty() {
-            continue;
-        }
-        tx.execute(
-            "INSERT INTO tags (name) VALUES (?1) ON CONFLICT(name) DO NOTHING",
-            params![tag],
-        )?;
-        let tag_id: i64 = tx.query_row(
-            "SELECT id FROM tags WHERE name = ?1",
-            params![tag],
-            |r| r.get(0),
-        )?;
-        tx.execute(
-            "INSERT INTO secret_tags (secret_id, tag_id) VALUES (?1, ?2)
-             ON CONFLICT DO NOTHING",
-            params![id.to_string(), tag_id],
-        )?;
-    }
-    Ok(())
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -426,80 +371,70 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    fn meta(name: &str) -> SecretMeta {
-        SecretMeta::new(name, SecretType::Password)
+    /// Inserts a row with placeholder sealed bytes, returning its id.
+    fn insert(v: &mut Vault, meta_blob: &[u8], payload_blob: &[u8]) -> (Uuid, Uuid) {
+        let id = Uuid::new_v4();
+        let meta_id = Uuid::new_v4();
+        v.insert_row(&id, &meta_id, meta_blob, payload_blob).unwrap();
+        (id, meta_id)
     }
 
     #[test]
     fn insert_and_read_back() {
         let mut v = Vault::open_in_memory().unwrap();
-        let mut m = meta("GitHub");
-        m.domain = "github.com".into();
-        m.username = "octocat".into();
+        let (id, meta_id) = insert(&mut v, b"sealed-meta", b"sealed-payload");
 
-        v.insert(&m, b"sealed-bytes").unwrap();
-
-        let all = v.list_meta().unwrap();
-        assert_eq!(all.len(), 1);
-        assert_eq!(all[0].name, "GitHub");
-        assert_eq!(all[0].domain, "github.com");
-        assert_eq!(all[0].id, m.id);
-        assert_eq!(v.get_blob(&m.id).unwrap(), b"sealed-bytes");
+        let rows = v.list_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id);
+        assert_eq!(rows[0].meta_id, meta_id);
+        assert_eq!(rows[0].meta_blob, b"sealed-meta");
+        assert_eq!(v.get_blob(&id).unwrap(), b"sealed-payload");
     }
 
     #[test]
-    fn list_meta_does_not_expose_blobs() {
-        // Structural guarantee: SecretMeta has no field that could hold one.
+    fn list_rows_never_reads_payload_blobs() {
+        // The list path must not pull payload ciphertext; the struct has no
+        // field for it, so this is a structural guarantee.
         let mut v = Vault::open_in_memory().unwrap();
-        let m = meta("Thing");
-        v.insert(&m, b"sealed").unwrap();
-        let all = v.list_meta().unwrap();
-        assert_eq!(all.len(), 1);
-        let rendered = format!("{:?}", all[0]);
-        assert!(!rendered.contains("sealed"));
+        insert(&mut v, b"m", b"payload-should-not-appear");
+        let rows = v.list_rows().unwrap();
+        let rendered = format!("{rows:?}");
+        assert!(!rendered.contains("payload-should-not-appear"));
     }
 
     #[test]
-    fn update_replaces_metadata_blob_and_tags() {
+    fn update_replaces_both_blobs() {
         let mut v = Vault::open_in_memory().unwrap();
-        let mut m = meta("Old");
-        m.tags = vec!["work".into(), "temp".into()];
-        v.insert(&m, b"blob-1").unwrap();
+        let (id, _) = insert(&mut v, b"meta-1", b"payload-1");
 
-        m.name = "New".into();
-        m.tags = vec!["work".into()];
-        v.update(&m, b"blob-2").unwrap();
+        let new_meta_id = Uuid::new_v4();
+        v.update_row(&id, &new_meta_id, b"meta-2", b"payload-2").unwrap();
 
-        let all = v.list_meta().unwrap();
-        assert_eq!(all[0].name, "New");
-        assert_eq!(all[0].tags, vec!["work"]);
-        assert_eq!(v.get_blob(&m.id).unwrap(), b"blob-2");
+        let row = v.get_meta_row(&id).unwrap();
+        assert_eq!(row.meta_id, new_meta_id);
+        assert_eq!(row.meta_blob, b"meta-2");
+        assert_eq!(v.get_blob(&id).unwrap(), b"payload-2");
     }
 
     #[test]
     fn update_of_a_missing_secret_is_an_error() {
         let mut v = Vault::open_in_memory().unwrap();
         assert!(matches!(
-            v.update(&meta("ghost"), b"blob"),
+            v.update_row(&Uuid::new_v4(), &Uuid::new_v4(), b"m", b"p"),
             Err(VaultError::NotFound(_))
         ));
     }
 
     #[test]
-    fn delete_removes_the_secret_and_its_tag_links() {
+    fn delete_removes_the_secret() {
         let mut v = Vault::open_in_memory().unwrap();
-        let mut m = meta("Temp");
-        m.tags = vec!["throwaway".into()];
-        v.insert(&m, b"blob").unwrap();
+        let (id, _) = insert(&mut v, b"m", b"p");
 
-        v.delete(&m.id).unwrap();
+        v.delete(&id).unwrap();
 
         assert_eq!(v.count().unwrap(), 0);
-        assert!(matches!(v.get_blob(&m.id), Err(VaultError::NotFound(_))));
-        assert!(
-            v.all_tags().unwrap().is_empty(),
-            "orphaned tag should be pruned"
-        );
+        assert!(matches!(v.get_blob(&id), Err(VaultError::NotFound(_))));
     }
 
     #[test]
@@ -509,32 +444,6 @@ mod tests {
             v.delete(&Uuid::new_v4()),
             Err(VaultError::NotFound(_))
         ));
-    }
-
-    #[test]
-    fn tags_are_shared_between_secrets_not_duplicated() {
-        let mut v = Vault::open_in_memory().unwrap();
-        let mut a = meta("A");
-        a.tags = vec!["work".into()];
-        let mut b = meta("B");
-        b.tags = vec!["work".into(), "cloud".into()];
-        v.insert(&a, b"x").unwrap();
-        v.insert(&b, b"y").unwrap();
-
-        assert_eq!(v.all_tags().unwrap(), vec!["cloud", "work"]);
-
-        // Deleting one secret must not remove a tag the other still uses.
-        v.delete(&a.id).unwrap();
-        assert_eq!(v.all_tags().unwrap(), vec!["cloud", "work"]);
-    }
-
-    #[test]
-    fn blank_tags_are_ignored() {
-        let mut v = Vault::open_in_memory().unwrap();
-        let mut m = meta("A");
-        m.tags = vec!["  ".into(), "".into(), " work ".into()];
-        v.insert(&m, b"x").unwrap();
-        assert_eq!(v.all_tags().unwrap(), vec!["work"]);
     }
 
     #[test]
@@ -559,7 +468,7 @@ mod tests {
     fn missing_required_meta_is_an_error() {
         let v = Vault::open_in_memory().unwrap();
         assert!(matches!(
-            v.require_meta_bytes(META_CREDENTIAL_ID),
+            v.require_meta_bytes(META_ENROLLMENTS),
             Err(VaultError::BadMeta(_))
         ));
     }
@@ -577,18 +486,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = VaultPaths::at(tmp.path().join("vault"));
 
-        let m = {
+        let id = {
             let mut v = Vault::open(&paths).unwrap();
-            let m = meta("Persisted");
-            v.insert(&m, b"blob").unwrap();
+            let (id, _) = insert(&mut v, b"m", b"blob");
             v.set_meta("k", "v").unwrap();
-            m
+            id
         };
 
         // Reopening must not re-run migrations destructively.
         let v = Vault::open(&paths).unwrap();
         assert_eq!(v.count().unwrap(), 1);
-        assert_eq!(v.get_blob(&m.id).unwrap(), b"blob");
+        assert_eq!(v.get_blob(&id).unwrap(), b"blob");
         assert_eq!(v.get_meta("k").unwrap().unwrap(), "v");
     }
 
@@ -603,28 +511,37 @@ mod tests {
     }
 
     #[test]
-    fn list_is_ordered_by_recency() {
-        let mut v = Vault::open_in_memory().unwrap();
-        let mut older = meta("Older");
-        older.updated_at = 1_000;
-        let mut newer = meta("Newer");
-        newer.updated_at = 2_000;
-        v.insert(&older, b"a").unwrap();
-        v.insert(&newer, b"b").unwrap();
-
-        let all = v.list_meta().unwrap();
-        assert_eq!(all[0].name, "Newer");
-        assert_eq!(all[1].name, "Older");
+    fn a_v1_database_is_refused_rather_than_corrupted() {
+        // Simulate a pre-encryption vault: a `secrets` table with the old
+        // plaintext columns and user_version = 1. Opening it must error
+        // clearly, not silently proceed against a mismatched schema.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = VaultPaths::at(tmp.path().join("vault"));
+        paths.ensure_dirs().unwrap();
+        {
+            let conn = Connection::open(paths.db()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE secrets (id TEXT PRIMARY KEY, name TEXT, encrypted_blob BLOB);
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            Vault::open(&paths),
+            Err(VaultError::IncompatibleSchema)
+        ));
     }
 
     #[test]
-    fn get_meta_for_finds_one_secret() {
+    fn get_meta_row_finds_one_secret() {
         let mut v = Vault::open_in_memory().unwrap();
-        let m = meta("Target");
-        v.insert(&m, b"x").unwrap();
-        assert_eq!(v.get_meta_for(&m.id).unwrap().name, "Target");
+        let (id, meta_id) = insert(&mut v, b"target-meta", b"p");
+        let row = v.get_meta_row(&id).unwrap();
+        assert_eq!(row.meta_id, meta_id);
+        assert_eq!(row.meta_blob, b"target-meta");
         assert!(matches!(
-            v.get_meta_for(&Uuid::new_v4()),
+            v.get_meta_row(&Uuid::new_v4()),
             Err(VaultError::NotFound(_))
         ));
     }

@@ -36,19 +36,23 @@ this and everything else it needs.
 
 With a `mock-hw` build and the daemon running:
 
-- **Meta+Shift+V** opens a centered popup listing your secrets, with the
-  keyboard grabbed exclusively so it always receives input.
-- Type to fuzzy-search across name, site, username and tags; arrow keys move
+- **Meta+Shift+V** opens a centered popup, with the keyboard grabbed
+  exclusively so it always receives input. It starts **empty**: your secrets'
+  names and sites are encrypted, so nothing is shown until you unlock.
+- Touch your YubiKey and enter its **PIN** to unlock. The list then appears and
+  you can fuzzy-search across name, site, username and tags; arrow keys move
   the selection; **Enter** decrypts the secret and types it into whatever had
   focus before the popup opened.
 - **Ctrl+N** adds, **Ctrl+E** edits (demanding a fresh touch first),
   **Ctrl+D** deletes with a confirmation. **Esc** backs out of anything.
 - **+ Add** in the header, or Ctrl+N, opens the editor; **Save** or Ctrl+S
   commits it. Each row has an **x** that asks for confirmation and then a
-  fresh YubiKey touch before deleting.
+  fresh YubiKey touch and PIN before deleting.
 - The vault relocks 60 seconds after the last use, zeroizing the inner key.
-- If your authenticator has a PIN, the popup asks for it when the key demands
-  verification.
+- A **PIN is required on every unlock**, as a second factor on top of the
+  touch. A key with no PIN configured cannot be used.
+- Enroll a **backup YubiKey** with `sypherstore enroll-key` so a lost primary
+  does not lose the vault.
 
 Both hardware layers are live: the outer key is sealed by the TPM and the
 inner key comes from a FIDO2 `hmac-secret` assertion that requires a touch.
@@ -175,10 +179,15 @@ Hardware-dependent tests are gated behind `--features hw-tests` and are
 
 ## Security notes
 
-- **Metadata is not encrypted.** Names, domains, usernames and tags are stored
-  in the clear so the popup can render and search instantly without a touch.
-  An attacker with the file learns which sites you have accounts on, but not a
-  single credential. This is a deliberate tradeoff, documented in the spec.
+- **Metadata is encrypted too.** Names, domains, usernames and tags are sealed
+  in their own double envelope, so an attacker with the file learns only the
+  number of rows, not which sites you have accounts on. The cost is that the
+  popup shows nothing until you unlock.
+- **A PIN is required on every unlock**, as a second factor on top of the
+  touch, so a stolen-and-plugged key alone unlocks nothing.
+- **A backup YubiKey can be enrolled** with `sypherstore enroll-key` (run from
+  a vault unlocked by an already-enrolled key). Either key then opens the
+  vault, and losing one no longer loses it.
 - **The `mock-hw` feature is not a build flag to be casual about.** It writes
   key material to plain files in the vault directory. Every command in such a
   build prints a warning, and `doctor` reports it as a warning too.
@@ -186,9 +195,9 @@ Hardware-dependent tests are gated behind `--features hw-tests` and are
   redacted `Debug`. The process sets `PR_SET_DUMPABLE=0` and `RLIMIT_CORE=0` at
   startup.
 - **Root is outside the threat model.** So is a compromised kernel.
-- **Lose the authenticator and the secrets are gone.** No passphrase fallback;
-  it would be a second and much weaker way in. A dead TPM is survivable via the
-  recovery key above.
+- **Lose every enrolled authenticator and the secrets are gone.** No passphrase
+  fallback; it would be a second and much weaker way in. Enroll a backup key
+  before you need it. A dead TPM is survivable via the recovery key above.
 
 The full analysis, including the gaps, is in [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 

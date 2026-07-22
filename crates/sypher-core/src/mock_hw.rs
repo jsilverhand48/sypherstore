@@ -132,13 +132,22 @@ impl InnerKeyProvider for MockInnerProvider {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut seed = [0u8; 32];
-        getrandom::getrandom(&mut seed).map_err(|e| ProviderError::Device(e.to_string()))?;
 
-        let mut file = BANNER.to_vec();
-        file.extend_from_slice(&seed);
-        write_private_atomic(&self.path, &file)
-            .map_err(|e| ProviderError::Device(e.to_string()))?;
+        // One mock file stands for one physical authenticator. Registering a
+        // second credential on it (as `enroll-key` does) must NOT regenerate
+        // the seed, or the first credential's derived secret would change and
+        // its vault would stop opening. Real hardware keeps its device secret
+        // across registrations; only the per-credential id differs, and the
+        // mock already varies its output by credential id. So keep any existing
+        // seed and only create one the first time.
+        if !self.path.exists() {
+            let mut seed = [0u8; 32];
+            getrandom::getrandom(&mut seed).map_err(|e| ProviderError::Device(e.to_string()))?;
+            let mut file = BANNER.to_vec();
+            file.extend_from_slice(&seed);
+            write_private_atomic(&self.path, &file)
+                .map_err(|e| ProviderError::Device(e.to_string()))?;
+        }
 
         // The real provider returns an authenticator-chosen credential id; a
         // random one here keeps the calling code identical.

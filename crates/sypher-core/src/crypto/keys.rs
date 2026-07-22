@@ -5,9 +5,16 @@
 //! - `outer_kek`, 32 random bytes sealed by the TPM. Recovered once at cold
 //!   start and resident for the process lifetime. It binds the vault to *this
 //!   machine*: copying `vault.db` to another host yields an undecryptable file.
-//! - `inner_kek`, derived from a FIDO2 `hmac-secret` assertion. Resident only
-//!   while the vault is unlocked. It binds the vault to *this YubiKey*, and
-//!   because the assertion requires a touch, to a deliberate human action.
+//! - `inner_kek`, 32 random bytes generated once at `init`. Resident only while
+//!   the vault is unlocked. It is never stored in the clear: instead one
+//!   *wrapped* copy is kept per enrolled authenticator, each encrypted under a
+//!   key derived from that authenticator's `hmac-secret` output. Unlocking means
+//!   touching any enrolled key, deriving its wrap key, and unwrapping `inner_kek`.
+//!
+//! This indirection is what lets a **second** YubiKey open the same vault: a
+//! new enrollment is just another wrapped copy of the one `inner_kek`. It also
+//! means losing one key does not change the key that actually encrypts secrets,
+//! so the other enrolled keys keep working untouched.
 //!
 //! Neither root key ever encrypts a secret directly. Each secret gets its own
 //! pair of subkeys derived from its UUID via HKDF-Expand. This costs one hash
@@ -17,7 +24,9 @@
 //!
 //! ```text
 //!   TPM ──seal──> outer_kek ──HKDF-Expand(uuid)──> k_outer_i ──> outer layer
-//!   FIDO2 hmac-secret ──HKDF-Extract(salt)──> inner_kek ──HKDF-Expand(uuid)──> k_inner_i
+//!   random ──> inner_kek ──HKDF-Expand(uuid)──> k_inner_i ──> inner layer
+//!                  ▲
+//!   FIDO2 hmac-secret ──HKDF-Extract(salt)──> wrap_key ──unwrap──┘ (per enrolled key)
 //! ```
 
 use hkdf::Hkdf;
@@ -89,14 +98,20 @@ pub enum KeyError {
     Random(#[from] getrandom::Error),
 }
 
-/// Derives `inner_kek` from a raw FIDO2 hmac-secret output.
+/// Derives an authenticator's *wrap key* from a raw FIDO2 hmac-secret output.
+///
+/// This no longer produces `inner_kek` directly. `inner_kek` is a random key
+/// generated at init; each enrolled authenticator instead derives a distinct
+/// wrap key here and stores `inner_kek` encrypted under it (see
+/// [`crate::crypto::envelope::wrap_key`]). Two enrolled keys therefore hold two
+/// independent wrap keys for the same `inner_kek`.
 ///
 /// The vault's KDF salt is used as the HKDF salt so that two vaults registered
-/// against the same YubiKey credential still end up with independent inner
-/// keys. Extract-then-expand is the right construction here because the
-/// hmac-secret output, while high entropy, is not guaranteed to be uniformly
-/// distributed the way a key we generated ourselves would be.
-pub fn derive_inner_kek(hmac_secret: &[u8], vault_salt: &[u8]) -> Result<Key, KeyError> {
+/// against the same YubiKey credential still end up with independent wrap keys.
+/// Extract-then-expand is the right construction here because the hmac-secret
+/// output, while high entropy, is not guaranteed to be uniformly distributed
+/// the way a key we generated ourselves would be.
+pub fn derive_wrap_key(hmac_secret: &[u8], vault_salt: &[u8]) -> Result<Key, KeyError> {
     let hk = Hkdf::<Sha256>::new(Some(vault_salt), hmac_secret);
     let mut out = SecureBuf::zeroed(KEY_LEN);
     hk.expand(INFO_INNER_KEK, &mut out).map_err(|_| KeyError::Hkdf)?;
@@ -170,7 +185,36 @@ pub trait InnerKeyProvider: Send + Sync {
     /// Performs an assertion against `credential_id` with `salt`, returning
     /// the raw hmac-secret output. The same inputs must always yield the same
     /// output, since that is what makes the vault decryptable across sessions.
+    ///
+    /// Used at enrollment, when exactly one credential is in play.
     fn assert_secret(&self, credential_id: &[u8], salt: &[u8]) -> Result<SecureBuf, ProviderError>;
+
+    /// Asserts against whichever of `credential_ids` the present authenticator
+    /// actually holds, returning that credential id together with its
+    /// hmac-secret output.
+    ///
+    /// This is the unlock path for a vault with more than one enrolled key. A
+    /// real authenticator answers with a single touch by passing every id in
+    /// the request's allow-list and reporting which one it used; the default
+    /// implementation here (used by the mock) just tries them in order, which
+    /// is correct but would cost a touch per attempt on real hardware, so the
+    /// hardware provider overrides it.
+    fn assert_first_available(
+        &self,
+        credential_ids: &[Vec<u8>],
+        salt: &[u8],
+    ) -> Result<(Vec<u8>, SecureBuf), ProviderError> {
+        let mut last_err = None;
+        for id in credential_ids {
+            match self.assert_secret(id, salt) {
+                Ok(secret) => return Ok((id.clone(), secret)),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or(ProviderError::NoDevice(
+            "no credential ids to try".into(),
+        )))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -202,19 +246,19 @@ mod tests {
     }
 
     #[test]
-    fn inner_kek_derivation_is_deterministic() {
-        let a = derive_inner_kek(b"hmac-secret-output", &fixed_salt()).unwrap();
-        let b = derive_inner_kek(b"hmac-secret-output", &fixed_salt()).unwrap();
+    fn wrap_key_derivation_is_deterministic() {
+        let a = derive_wrap_key(b"hmac-secret-output", &fixed_salt()).unwrap();
+        let b = derive_wrap_key(b"hmac-secret-output", &fixed_salt()).unwrap();
         assert_eq!(a, b, "two assertions with the same salt must agree");
     }
 
     #[test]
-    fn inner_kek_depends_on_both_secret_and_salt() {
-        let base = derive_inner_kek(b"secret-a", &fixed_salt()).unwrap();
-        let other_secret = derive_inner_kek(b"secret-b", &fixed_salt()).unwrap();
-        let other_salt = derive_inner_kek(b"secret-a", &[9u8; SALT_LEN]).unwrap();
+    fn wrap_key_depends_on_both_secret_and_salt() {
+        let base = derive_wrap_key(b"secret-a", &fixed_salt()).unwrap();
+        let other_secret = derive_wrap_key(b"secret-b", &fixed_salt()).unwrap();
+        let other_salt = derive_wrap_key(b"secret-a", &[9u8; SALT_LEN]).unwrap();
         assert_ne!(base, other_secret);
-        assert_ne!(base, other_salt, "vaults must not share an inner key");
+        assert_ne!(base, other_salt, "vaults must not share a wrap key");
     }
 
     #[test]

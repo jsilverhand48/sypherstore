@@ -43,8 +43,9 @@ With a `mock-hw` build and the daemon running:
   focus before the popup opened.
 - **Ctrl+N** adds, **Ctrl+E** edits (demanding a fresh touch first),
   **Ctrl+D** deletes with a confirmation. **Esc** backs out of anything.
-- **+ Add** in the header, or Ctrl+N, opens the editor. Each row has an **x**
-  that asks for confirmation and then a fresh YubiKey touch before deleting.
+- **+ Add** in the header, or Ctrl+N, opens the editor; **Save** or Ctrl+S
+  commits it. Each row has an **x** that asks for confirmation and then a
+  fresh YubiKey touch before deleting.
 - The vault relocks 60 seconds after the last use, zeroizing the inner key.
 - If your authenticator has a PIN, the popup asks for it when the key demands
   verification.
@@ -79,6 +80,20 @@ Builds a release binary, installs it and the systemd user unit, checks the
 environment, creates the vault, and walks you through storing the recovery key.
 Run it as your normal user; it uses sudo only for the `tss` group and the udev
 rule, and asks first. It refuses to install a `mock-hw` build.
+
+### Updating
+
+```sh
+./install.sh --update
+```
+
+Rebuilds and replaces only the binary and the systemd unit, restarting the
+daemon if it was running. It never runs `init`, issues no TPM command, never
+contacts the authenticator, and needs no sudo, so shipping a UI fix cannot
+cost you your secrets. It tolerates a missing TPM for the same reason.
+
+The one thing it does run is `doctor`, as the guard that refuses to install a
+`mock-hw` build; that only stats paths and checks permissions.
 
 ## Building
 

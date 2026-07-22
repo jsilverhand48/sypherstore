@@ -20,12 +20,18 @@
 //! the touch is worth it, instead of being asked to authenticate before they
 //! know what they will get.
 //!
-//! ## Keyboard only
+//! ## Keyboard first, but not keyboard only
 //!
-//! There is no mouse affordance beyond clicking a row. Up/Down move the
-//! selection, Enter uses it, Escape dismisses, and typing filters. The window
-//! has no title bar to drag and no buttons to click, because reaching for the
-//! mouse would cost more time than typing the site name.
+//! Every action has a key: Up/Down move the selection, Enter uses it, Escape
+//! dismisses, typing filters, and Ctrl+N/E/D add, edit and delete. The window
+//! has no title bar to drag, because reaching for the mouse costs more time
+//! than typing the site name.
+//!
+//! The clickable affordances (the **+ Add** button, each row's **x**, and
+//! **Save**/**Cancel** in the editor) exist anyway, for two reasons: they
+//! advertise what is possible to someone who has not memorised the chords, and
+//! a destructive or committing action is worth making explicit rather than
+//! leaving it to a chord that has to be known in advance.
 
 use std::sync::mpsc::Sender;
 
@@ -609,7 +615,15 @@ impl Popup {
     }
 
     /// The add/edit form.
+    ///
+    /// The Save and Cancel clicks are collected into locals and acted on after
+    /// the `editor` borrow ends: `save_editor` takes `&mut self`, so calling it
+    /// from inside the drawing closure would not borrow-check.
     fn draw_edit_mode(&mut self, ui: &mut egui::Ui) {
+        let mut save = false;
+        let mut cancel = false;
+
+        {
         let Mode::Edit(editor) = &mut self.mode else {
             return;
         };
@@ -622,6 +636,12 @@ impl Popup {
         });
         ui.separator();
 
+        // Reserve the button row before the form claims the rest of the
+        // height, otherwise the scroll area fills the surface and pushes Save
+        // off the bottom where it cannot be clicked.
+        let footer_height = 38.0;
+        let body_height = (ui.available_height() - footer_height).max(0.0);
+        ui.allocate_ui(egui::vec2(ui.available_width(), body_height), |ui| {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -658,12 +678,33 @@ impl Popup {
                         text_row(ui, "Notes", &mut editor.notes, Field::Notes, editor.focus, &mut editor.focus_dirty, false);
                         ui.end_row();
                     });
-
-                if let Some(error) = &editor.error {
-                    ui.add_space(8.0);
-                    ui.colored_label(egui::Color32::from_rgb(0xE0, 0x6C, 0x75), error);
-                }
             });
+        });
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button("  Save  ").clicked() {
+                save = true;
+            }
+            if ui.button("  Cancel  ").clicked() {
+                cancel = true;
+            }
+            // Beside the buttons rather than under the form: a validation
+            // failure is a response to pressing Save, and inside the scroll
+            // area it could be scrolled out of sight.
+            if let Some(error) = &editor.error {
+                ui.colored_label(egui::Color32::from_rgb(0xE0, 0x6C, 0x75), error);
+            }
+        });
+        }
+
+        if cancel {
+            // Dropping the Editor zeroizes the plaintext it was holding.
+            self.mode = Mode::List;
+            self.needs_focus = true;
+        } else if save {
+            self.save_editor();
+        }
     }
 
     /// The delete confirmation.

@@ -25,7 +25,7 @@ YubiKey, DBus, a portal or a window is in this crate.
 
 Planned, not yet present: `hw/tpm.rs`, `hw/fido.rs`.
 
-## Two decisions worth knowing before you edit
+## Three decisions worth knowing before you edit
 
 **The popup is a layer-shell surface, not a normal window.** `winit`'s Wayland
 backend implements `set_visible` as a no-op, so a window created hidden can
@@ -39,6 +39,14 @@ as the KGlobalAccel component name. `ashpd` randomizes it per session and does
 not expose the field, so every restart registered a new component and only the
 first one to claim the key kept it. A fixed token means one component that
 survives restarts. See the module docs in `hotkey.rs`.
+
+**Input translation in `ui/shell` is where UI bugs hide.** `popup.rs` is
+tested against synthesised `Keys` and egui events, so its tests pass whether or
+not the shell ever produces those events. Two things reached the user broken
+this way: the shell had no `PointerHandler` at all, and `translate_keysym`
+dropped every letter, which killed all four Ctrl chords because text is
+suppressed while Ctrl is held. When a control does nothing, suspect the
+translation before the state machine.
 
 ## Commands
 

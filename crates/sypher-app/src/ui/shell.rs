@@ -433,7 +433,11 @@ impl Shell {
 
         let popup = &mut self.popup;
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
-            egui::Frame::central_panel(ui.style()).show(ui, |ui| popup.draw(ui));
+            // A `CentralPanel` rather than a bare `Frame`: a Frame's background
+            // shrinks to fit its contents, so a short list left the rest of the
+            // surface showing the render pass clear colour as a dark slab. The
+            // panel claims the whole rect whatever the mode draws into it.
+            egui::CentralPanel::default().show(ui, |ui| popup.draw(ui));
         });
 
         // Ask to be woken again if egui has more to draw. Capped, because
@@ -566,8 +570,13 @@ impl Shell {
 
 /// Maps an X keysym to egui's key enum.
 ///
-/// Only the keys the popup acts on are translated. Everything else arrives as
-/// text, which is all the search box needs.
+/// Navigation keys are listed explicitly; letters and digits fall through to
+/// the ASCII branch below.
+///
+/// Translating letters is not optional. A `Ctrl` chord produces no text event
+/// at all (see [`Shell::push_key`]), so if the letter is not turned into an
+/// `egui::Key` here, `Ctrl+S`, `Ctrl+N`, `Ctrl+E` and `Ctrl+D` reach the popup
+/// as nothing whatsoever and every documented shortcut silently does nothing.
 fn translate_keysym(sym: Keysym) -> Option<egui::Key> {
     Some(match sym {
         Keysym::Escape => egui::Key::Escape,
@@ -583,7 +592,14 @@ fn translate_keysym(sym: Keysym) -> Option<egui::Key> {
         Keysym::End => egui::Key::End,
         Keysym::Page_Up => egui::Key::PageUp,
         Keysym::Page_Down => egui::Key::PageDown,
-        _ => return None,
+        // The printable keysyms are their own ASCII codepoints, so a letter or
+        // digit can be named directly. `from_name` accepts either case, which
+        // matters because holding Shift changes the keysym to the uppercase
+        // one and a shortcut must still register.
+        other => {
+            let ch = char::from_u32(other.raw()).filter(char::is_ascii_alphanumeric)?;
+            return egui::Key::from_name(ch.encode_utf8(&mut [0u8; 4]));
+        }
     })
 }
 
@@ -945,11 +961,48 @@ mod tests {
     }
 
     #[test]
-    fn printable_keys_are_left_to_the_text_path() {
-        // Letters must not become egui::Key events, or the search box would
-        // receive both a key press and its text and could double-insert.
-        assert_eq!(translate_keysym(Keysym::a), None);
-        assert_eq!(translate_keysym(Keysym::Z), None);
-        assert_eq!(translate_keysym(Keysym::_1), None);
+    fn letters_and_digits_are_translated() {
+        // This previously returned None, on the theory that a letter arriving
+        // as both a Key and a Text event would double-insert into the search
+        // box. It does not: egui's TextEdit inserts from Text events only, and
+        // every upstream backend sends both. What it did break was every
+        // Ctrl chord, since push_key suppresses text while Ctrl is held, so
+        // the popup saw no event at all.
+        assert_eq!(translate_keysym(Keysym::a), Some(egui::Key::A));
+        assert_eq!(translate_keysym(Keysym::z), Some(egui::Key::Z));
+        assert_eq!(translate_keysym(Keysym::_1), Some(egui::Key::Num1));
+    }
+
+    #[test]
+    fn shifted_letters_map_to_the_same_key() {
+        // Holding Shift changes the keysym to the uppercase one. A shortcut
+        // must still register, so both cases must land on the same egui::Key.
+        for (lower, upper) in [
+            (Keysym::s, Keysym::S),
+            (Keysym::n, Keysym::N),
+            (Keysym::d, Keysym::D),
+        ] {
+            assert_eq!(translate_keysym(lower), translate_keysym(upper));
+            assert!(translate_keysym(lower).is_some());
+        }
+    }
+
+    #[test]
+    fn the_editor_shortcuts_all_resolve() {
+        // The keys the footer advertises. Each one silently did nothing until
+        // the ASCII fallthrough was added.
+        assert_eq!(translate_keysym(Keysym::s), Some(egui::Key::S));
+        assert_eq!(translate_keysym(Keysym::n), Some(egui::Key::N));
+        assert_eq!(translate_keysym(Keysym::e), Some(egui::Key::E));
+        assert_eq!(translate_keysym(Keysym::d), Some(egui::Key::D));
+    }
+
+    #[test]
+    fn non_printable_keysyms_are_ignored() {
+        // Modifiers and function keys have keysyms far above the ASCII range;
+        // char::from_u32 must not turn them into a stray letter.
+        assert_eq!(translate_keysym(Keysym::Shift_L), None);
+        assert_eq!(translate_keysym(Keysym::Control_L), None);
+        assert_eq!(translate_keysym(Keysym::space), None);
     }
 }

@@ -23,7 +23,12 @@ YubiKey, DBus, a portal or a window is in this crate.
 | `browser/url` | Focused-tab URL extraction over AT-SPI2. Best effort. |
 | `pin` | Bridges the synchronous CTAP PIN callback to the asynchronous popup. |
 
-Planned, not yet present: `hw/tpm.rs`, `hw/fido.rs`.
+`hw/fido.rs` opens each connected authenticator individually and picks its
+target deliberately: unlock goes to the key that answers a silent CTAP2
+pre-flight probe (an assertion with `up=false`, no PIN, no touch) for an
+enrolled credential, and `enroll-key` registers on a connected key that does
+NOT answer it. Two keys plugged in at once is the normal enrollment case, not
+an error.
 
 ## Three decisions worth knowing before you edit
 
@@ -57,7 +62,7 @@ translation before the state machine.
 | `add <name>` | yes | Prompts for the secret without echo, or `--stdin`. |
 | `list [query]` | yes | Metadata is encrypted, so listing unlocks. `--host` filters by site. |
 | `delete <target>` | yes | Resolving a name needs an unlock; the touch is also the required reauth. `VACUUM`s afterwards. |
-| `enroll-key [--label]` | yes | Enrolls a backup authenticator. Unlock with an enrolled key, then present the new one. |
+| `enroll-key [--label]` | yes | Enrolls a backup authenticator. Unlock with an enrolled key, then present the new one; both keys may stay connected, the new registration is directed at the un-enrolled key. |
 | `dev decrypt <target>` | yes | Prints a secret. Development only. |
 | `dev unlock-test` | yes | Verifies the keys without reading a secret. |
 | `dev info` | no | Resolved paths and effective config. |

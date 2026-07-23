@@ -182,6 +182,21 @@ pub trait InnerKeyProvider: Send + Sync {
     /// alongside the vault. Called once, at `sypherstore init`.
     fn provision(&self) -> Result<Vec<u8>, ProviderError>;
 
+    /// Registers a credential on an authenticator that is NOT one of
+    /// `existing_credential_ids`.
+    ///
+    /// This is the enroll-key path: the already-enrolled key and the new key
+    /// are usually connected at the same time, and the registration must land
+    /// on the new one. Providers that cannot distinguish devices (like the
+    /// mock, which models exactly one authenticator) fall back to plain
+    /// `provision`.
+    fn provision_excluding(
+        &self,
+        _existing_credential_ids: &[Vec<u8>],
+    ) -> Result<Vec<u8>, ProviderError> {
+        self.provision()
+    }
+
     /// Performs an assertion against `credential_id` with `salt`, returning
     /// the raw hmac-secret output. The same inputs must always yield the same
     /// output, since that is what makes the vault decryptable across sessions.

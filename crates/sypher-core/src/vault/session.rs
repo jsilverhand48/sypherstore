@@ -190,7 +190,12 @@ impl Session {
         let kdf_salt = self.vault.require_meta_bytes(META_KDF_SALT)?;
         let mut enrollments = load_enrollments(&self.vault)?;
 
-        let credential_id = inner.provision()?;
+        // Tell the provider which credentials already exist, so a hardware
+        // provider can direct the registration at a key that is NOT already
+        // enrolled when several are connected at once.
+        let existing_ids: Vec<Vec<u8>> =
+            enrollments.iter().map(|e| e.credential_id.clone()).collect();
+        let credential_id = inner.provision_excluding(&existing_ids)?;
         if enrollments.iter().any(|e| e.credential_id == credential_id) {
             return Err(SessionError::AlreadyEnrolled);
         }

@@ -16,7 +16,7 @@ from ciphertext to plaintext; the rest of the crate is components it uses.
 | `model` | `SecretMeta` (searchable, now also sealed) and `SecretPayload` (encrypted). The split is a safety property, not organization. |
 | `vault::db` | SQLite storage. Never decrypts; each row is two opaque sealed blobs plus two random UUIDs. |
 | `vault::paths` | Vault location resolution and owner-only atomic writes. |
-| `vault::session` | Lock state machine, CRUD, and authenticator enrollment. Enforces "both keys or no plaintext". |
+| `vault::session` | Lock state machine, CRUD, and authenticator enrollment. Enforces "both keys or no plaintext". Enrollment passes the already-enrolled credential ids to `InnerKeyProvider::provision_excluding`, so a hardware provider can direct the new registration at a key that is not yet enrolled. |
 | `search::domain` | Hostname normalization and PSL-based domain matching. |
 | `search::fuzzy` | Ranking for the popup. Metadata only. |
 | `config` | Non-secret JSON configuration. |

@@ -227,7 +227,7 @@ fn cmd_enroll_key(paths: &VaultPaths, label: Option<String>) -> Result<ExitCode>
     );
 
     if !hw::IS_MOCK {
-        println!("\nNow connect the NEW authenticator to enroll.");
+        println!("\nNow connect the NEW authenticator (the enrolled key may stay plugged in).");
         println!("Touch it to register, then touch it again to derive its key.");
     }
     let label = label.unwrap_or_else(|| "backup".to_string());

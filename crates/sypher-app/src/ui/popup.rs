@@ -32,6 +32,19 @@
 //! advertise what is possible to someone who has not memorised the chords, and
 //! a destructive or committing action is worth making explicit rather than
 //! leaving it to a chord that has to be known in advance.
+//!
+//! `Ctrl+V` pastes the clipboard into whichever field has focus. egui has no
+//! clipboard of its own, so the shell reads the selection and injects it; see
+//! [`Popup::wants_text_input`].
+//!
+//! ## Dismissal is mode-dependent
+//!
+//! The searchable list auto-hides the moment keyboard focus leaves it: a list
+//! that reveals secrets should not sit around unattended. A form the user is
+//! filling in does not, so clicking away to another window (say, to copy a
+//! value to paste back) never discards half-entered work. See
+//! [`Popup::keep_open_on_focus_loss`]; Escape and the on-screen buttons remain
+//! the deliberate way out.
 
 use std::sync::mpsc::Sender;
 
@@ -119,6 +132,11 @@ pub struct Popup {
 
     query: String,
     selected: usize,
+    /// Set when the keyboard moved the selection, so the list scrolls to keep
+    /// it visible exactly once. Without this gate the selected row would be
+    /// scrolled back into view every frame, which fights the mouse wheel and
+    /// snaps the view back to the top (the default selection is row 0).
+    scroll_to_selection: bool,
     lock_state: UiLockState,
     visible: bool,
     /// Set for one frame after showing, to move focus into the search box.
@@ -138,6 +156,7 @@ impl Popup {
             context: SearchContext::default(),
             query: String::new(),
             selected: 0,
+            scroll_to_selection: false,
             lock_state: UiLockState::Locked,
             visible: false,
             needs_focus: false,
@@ -314,9 +333,11 @@ impl Popup {
         }
         if keys.up && self.selected > 0 {
             self.selected -= 1;
+            self.scroll_to_selection = true;
         }
         if keys.down && self.selected + 1 < self.ranked.len() {
             self.selected += 1;
+            self.scroll_to_selection = true;
         }
         if keys.enter {
             self.activate_selected();
@@ -472,6 +493,10 @@ impl Popup {
         let usable = self.lock_state.is_unlocked();
         let mut clicked: Option<usize> = None;
         let mut delete_requested: Option<usize> = None;
+        // Consume the scroll request: the list follows the selection only on
+        // the frame the keyboard moved it, never every frame, or the mouse
+        // wheel would be fought and the view snapped back to the top row.
+        let scroll_to_selection = std::mem::take(&mut self.scroll_to_selection);
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -485,9 +510,10 @@ impl Popup {
                     if row.deleted {
                         delete_requested = Some(i);
                     }
-                    // Keep the keyboard selection on screen as the user
-                    // arrows past the visible window.
-                    if selected {
+                    // Keep the keyboard selection on screen as the user arrows
+                    // past the visible window, but only in response to that
+                    // keypress, so wheel scrolling is left alone.
+                    if selected && scroll_to_selection {
                         row.response.scroll_to_me(None);
                     }
                 }
@@ -766,6 +792,29 @@ impl Popup {
     pub fn wants_repaint(&self) -> bool {
         self.visible && (self.lock_state.is_unlocked() || self.message.is_some())
     }
+
+    /// Whether the popup should survive losing keyboard focus rather than
+    /// dismissing.
+    ///
+    /// The searchable list auto-hides when focus leaves, but a form the user is
+    /// part-way through (editor, delete confirmation, PIN entry) must not: they
+    /// may be clicking away to copy a value and will click back. Escape and the
+    /// on-screen buttons are always available to close it deliberately.
+    pub fn keep_open_on_focus_loss(&self) -> bool {
+        matches!(
+            self.mode,
+            Mode::Edit(_) | Mode::ConfirmDelete(..) | Mode::Pin(_)
+        )
+    }
+
+    /// Whether a focused text field is on screen that a paste should target.
+    ///
+    /// True in any mode with a `TextEdit` (the search box, the editor fields,
+    /// the PIN box), false for the delete confirmation, which has none.
+    pub fn wants_text_input(&self) -> bool {
+        self.visible
+            && matches!(self.mode, Mode::List | Mode::Edit(_) | Mode::Pin(_))
+    }
 }
 
 /// Draws one labelled text field in the editor grid.
@@ -931,6 +980,7 @@ mod tests {
             context: SearchContext::default(),
             query: String::new(),
             selected: 0,
+            scroll_to_selection: false,
             lock_state: UiLockState::Locked,
             visible: true,
             needs_focus: false,
@@ -1232,6 +1282,63 @@ mod tests {
         p.visible = false;
         p.handle_event(DaemonEvent::RequestPin { retry: true });
         assert!(p.visible, "a blocked assertion must be able to ask");
+    }
+
+    #[test]
+    fn the_list_dismisses_on_focus_loss_but_a_form_does_not() {
+        let (mut p, _rx) = popup();
+        // The searchable list should auto-hide.
+        assert!(matches!(p.mode, Mode::List));
+        assert!(!p.keep_open_on_focus_loss(), "the list may dismiss");
+
+        // The editor, a delete confirmation and the PIN prompt must survive a
+        // click away so the user can copy a value to paste back.
+        p.mode = Mode::Edit(Box::new(Editor::new()));
+        assert!(p.keep_open_on_focus_loss(), "the editor must stay open");
+
+        p.mode = Mode::ConfirmDelete(uuid::Uuid::new_v4(), "x".into());
+        assert!(p.keep_open_on_focus_loss(), "a confirmation must stay open");
+
+        p.mode = Mode::Pin(PinEntry::default());
+        assert!(p.keep_open_on_focus_loss(), "the PIN prompt must stay open");
+    }
+
+    #[test]
+    fn paste_targets_modes_with_a_text_field() {
+        let (mut p, _rx) = popup();
+        p.visible = true;
+        // Search box, editor fields and PIN box all accept a paste.
+        assert!(p.wants_text_input(), "the search box accepts a paste");
+        p.mode = Mode::Edit(Box::new(Editor::new()));
+        assert!(p.wants_text_input(), "editor fields accept a paste");
+        p.mode = Mode::Pin(PinEntry::default());
+        assert!(p.wants_text_input(), "the PIN box accepts a paste");
+        // The delete confirmation has no field to paste into.
+        p.mode = Mode::ConfirmDelete(uuid::Uuid::new_v4(), "x".into());
+        assert!(!p.wants_text_input(), "the confirmation has no text field");
+        // Nothing to paste into when hidden.
+        p.mode = Mode::List;
+        p.visible = false;
+        assert!(!p.wants_text_input(), "a hidden popup takes no paste");
+    }
+
+    #[test]
+    fn arrowing_requests_a_one_shot_scroll_to_the_selection() {
+        // The list should follow the keyboard selection, but only on the frame
+        // the key was pressed. A persistent request would fight the mouse wheel
+        // and snap the view back to the selected row every frame.
+        let (mut p, _rx) = popup();
+        p.rerank();
+        assert!(!p.scroll_to_selection, "nothing requested yet");
+
+        p.handle_list_keys(&keys_with(|k| k.down = true));
+        assert_eq!(p.selected, 1);
+        assert!(p.scroll_to_selection, "arrowing should request a scroll");
+
+        // draw_list consumes the request with mem::take; simulate that and
+        // confirm it does not persist into the next frame.
+        assert!(std::mem::take(&mut p.scroll_to_selection));
+        assert!(!p.scroll_to_selection, "the request lasts a single frame");
     }
 
     #[test]

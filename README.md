@@ -46,8 +46,10 @@ With a `mock-hw` build and the daemon running:
 - **Ctrl+N** adds, **Ctrl+E** edits (demanding a fresh touch first),
   **Ctrl+D** deletes with a confirmation. **Esc** backs out of anything.
 - **+ Add** in the header, or Ctrl+N, opens the editor; **Save** or Ctrl+S
-  commits it. Each row has an **x** that asks for confirmation and then a
-  fresh YubiKey touch and PIN before deleting.
+  commits it. **Ctrl+V** pastes into the focused field. The editor stays open
+  if you click away (unlike the list, which auto-hides), so you can copy a
+  value from another window and paste it back. Each row has an **x** that asks
+  for confirmation and then a fresh YubiKey touch and PIN before deleting.
 - The vault relocks 60 seconds after the last use, zeroizing the inner key.
 - A **PIN is required on every unlock**, as a second factor on top of the
   touch. A key with no PIN configured cannot be used.
@@ -187,7 +189,10 @@ Hardware-dependent tests are gated behind `--features hw-tests` and are
   touch, so a stolen-and-plugged key alone unlocks nothing.
 - **A backup YubiKey can be enrolled** with `sypherstore enroll-key` (run from
   a vault unlocked by an already-enrolled key). Either key then opens the
-  vault, and losing one no longer loses it.
+  vault, and losing one no longer loses it. Both keys may be plugged in at the
+  same time: a silent CTAP2 pre-flight probe identifies which connected key is
+  already enrolled, so the unlock targets that one and the new registration
+  targets the other.
 - **The `mock-hw` feature is not a build flag to be casual about.** It writes
   key material to plain files in the vault directory. Every command in such a
   build prints a warning, and `doctor` reports it as a warning too.

@@ -545,7 +545,25 @@ impl Shell {
 
     /// Pushes a key into egui's input queue.
     fn push_key(&mut self, event: &KeyEvent, pressed: bool) {
-        if let Some(key) = translate_keysym(event.keysym) {
+        let key = translate_keysym(event.keysym);
+
+        // Ctrl+V pastes the clipboard. egui cannot read the system clipboard
+        // itself, so we read it and hand it in as a Paste event, which is what
+        // its TextEdit consumes. We own the read, so it is skipped entirely
+        // unless the popup is actually accepting text (an editor field).
+        if pressed && self.modifiers.ctrl && key == Some(egui::Key::V) {
+            if self.popup.wants_text_input() {
+                match read_clipboard_text() {
+                    Ok(text) if !text.is_empty() => self.input.push(egui::Event::Paste(text)),
+                    Ok(_) => {}
+                    Err(e) => tracing::debug!(error = %e, "clipboard paste unavailable"),
+                }
+            }
+            // Do not also emit the V keystroke; the shortcut is consumed here.
+            return;
+        }
+
+        if let Some(key) = key {
             self.input.push(egui::Event::Key {
                 key,
                 physical_key: None,
@@ -565,6 +583,29 @@ impl Shell {
                 }
             }
         }
+    }
+}
+
+/// Reads the Wayland clipboard as plain UTF-8 text.
+///
+/// egui has no clipboard of its own, so pasting into an editor field means
+/// reading the selection ourselves. An empty or non-text clipboard is not an
+/// error, just nothing to paste.
+fn read_clipboard_text() -> Result<String, String> {
+    use std::io::Read;
+    use wl_clipboard_rs::paste::{get_contents, ClipboardType, Error, MimeType, Seat};
+
+    match get_contents(ClipboardType::Regular, Seat::Unspecified, MimeType::Text) {
+        Ok((mut pipe, _mime)) => {
+            let mut buf = Vec::new();
+            pipe.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+            Ok(String::from_utf8_lossy(&buf).into_owned())
+        }
+        // An empty clipboard is a normal, silent outcome.
+        Err(Error::NoSeats) | Err(Error::ClipboardEmpty) | Err(Error::NoMimeType) => {
+            Ok(String::new())
+        }
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -772,11 +813,19 @@ impl KeyboardHandler for Shell {
         _: u32,
     ) {
         // Losing focus while mapped means something took the keyboard from us.
-        // Dismiss rather than linger: a popup that cannot be typed into is
-        // just an obstruction, and one showing a secret list should not sit
-        // there unattended.
-        tracing::debug!("keyboard focus lost; dismissing");
+        // Modifier state is stale either way, so clear it.
         self.modifiers = egui::Modifiers::NONE;
+
+        // The secret list should not sit there unattended, so dismiss it. But a
+        // form the user is filling in (the editor, a delete confirmation, a PIN
+        // prompt) must survive a click away: they may be switching to another
+        // window to copy a value to paste back. Clicking the popup again regains
+        // focus. Escape and the on-screen buttons remain the way out.
+        if self.popup.keep_open_on_focus_loss() {
+            tracing::debug!("keyboard focus lost; keeping the form open");
+            return;
+        }
+        tracing::debug!("keyboard focus lost; dismissing");
         self.popup.force_hide();
     }
 

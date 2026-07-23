@@ -35,6 +35,18 @@
 //! whichever key is present answers with a single touch and reports which
 //! credential it used. That is how a backup YubiKey opens the same vault.
 //!
+//! ## More than one *connected* key
+//!
+//! Enrolling a backup necessarily means two authenticators are plugged in at
+//! once, so "open the first device" is never good enough: the PIN and the
+//! touch would go to whichever key enumerated first, not the one the user
+//! means. Every operation therefore picks its device deliberately, using the
+//! CTAP2 pre-flight trick: an assertion with `up=false` and no user
+//! verification succeeds only on the authenticator that actually holds a
+//! listed credential, without a touch and without a PIN. Unlock targets the
+//! key that answers for an enrolled credential; enrollment targets the key
+//! that does not.
+//!
 //! ## What an attacker with the vault but not the key can do
 //!
 //! Nothing. The inner ciphertext is sealed under a key derived from the
@@ -121,8 +133,13 @@ impl FidoInnerProvider {
         }
     }
 
-    /// Opens the first connected FIDO2 authenticator.
-    fn open(&self) -> Result<FidoKeyHid, ProviderError> {
+    /// Opens every connected FIDO2 authenticator individually.
+    ///
+    /// `FidoKeyHidFactory::create` refuses to run when more than one device is
+    /// connected, which would make enrolling a backup key (two keys plugged in
+    /// by definition) impossible. Opening each device by its own HID params
+    /// lets the callers below choose the right one deliberately.
+    fn open_all(&self) -> Result<Vec<OpenDevice>, ProviderError> {
         let devices = ctap_hid_fido2::get_fidokey_devices();
         if devices.is_empty() {
             return Err(ProviderError::NoDevice(
@@ -131,31 +148,106 @@ impl FidoInnerProvider {
                     .into(),
             ));
         }
-        if devices.len() > 1 {
-            // Which one gets used would otherwise be luck of enumeration
-            // order, and a vault registered against one key will not open
-            // with another.
-            tracing::warn!(
-                count = devices.len(),
-                "multiple FIDO2 authenticators connected; using the first"
-            );
+
+        let cfg = LibCfg::init();
+        let mut opened = Vec::new();
+        for dev in devices {
+            match FidoKeyHidFactory::create_by_params(&[dev.param], &cfg) {
+                Ok(device) => opened.push(OpenDevice {
+                    info: dev.info,
+                    device,
+                }),
+                // One unreadable device must not block the others; a doctor
+                // hint is only warranted if nothing opens at all.
+                Err(e) => tracing::warn!(device = %dev.info, error = %e,
+                    "could not open a FIDO2 authenticator; skipping it"),
+            }
+        }
+        if opened.is_empty() {
+            return Err(ProviderError::Device(
+                "no connected FIDO2 authenticator could be opened. Check that /dev/hidraw* \
+                 is readable (run `sypherstore doctor`)."
+                    .into(),
+            ));
+        }
+        Ok(opened)
+    }
+
+    /// Picks the connected authenticator that holds one of `credential_ids`.
+    ///
+    /// With a single device connected there is nothing to choose. With
+    /// several, each is asked silently whether it holds an enrolled
+    /// credential, so the PIN prompt and the touch go to the right key.
+    fn open_enrolled(&self, credential_ids: &[Vec<u8>]) -> Result<FidoKeyHid, ProviderError> {
+        let mut devices = self.open_all()?;
+        if devices.len() == 1 {
+            return Ok(devices.remove(0).device);
+        }
+        for dev in devices {
+            if holds_any(&dev.device, credential_ids) {
+                tracing::info!(device = %dev.info, "selected the enrolled authenticator");
+                return Ok(dev.device);
+            }
+        }
+        // No device answered the silent probe. Either none of them is
+        // enrolled, or one refuses pre-flight assertions; either way the user
+        // can resolve it by reducing to one device.
+        Err(ProviderError::Device(
+            "none of the connected authenticators answered for this vault's credentials. \
+             Leave only the enrolled key plugged in and try again."
+                .into(),
+        ))
+    }
+
+    /// Picks a connected authenticator that is NOT already enrolled.
+    ///
+    /// This is the enrollment path: the user typically has the enrolled key
+    /// and the new key plugged in at the same time, and the registration must
+    /// land on the new one.
+    fn open_unenrolled(&self, existing: &[Vec<u8>]) -> Result<FidoKeyHid, ProviderError> {
+        let mut devices = self.open_all()?;
+        if devices.len() == 1 {
+            let only = devices.remove(0);
+            if !existing.is_empty() && holds_any(&only.device, existing) {
+                return Err(ProviderError::Device(
+                    "the connected authenticator is already enrolled in this vault. \
+                     Connect the NEW key (the enrolled one may stay plugged in)."
+                        .into(),
+                ));
+            }
+            return Ok(only.device);
         }
 
-        FidoKeyHidFactory::create(&LibCfg::init()).map_err(|e| {
-            ProviderError::Device(format!("could not open the FIDO2 authenticator: {e}"))
-        })
+        let mut fresh: Vec<OpenDevice> = devices
+            .into_iter()
+            .filter(|dev| !holds_any(&dev.device, existing))
+            .collect();
+        match fresh.len() {
+            0 => Err(ProviderError::Device(
+                "every connected authenticator is already enrolled in this vault. \
+                 Connect the new key you want to enroll."
+                    .into(),
+            )),
+            1 => {
+                let dev = fresh.remove(0);
+                tracing::info!(device = %dev.info, "selected the new authenticator");
+                Ok(dev.device)
+            }
+            // Registering on an arbitrary one of several candidate keys would
+            // leave the user unsure which physical key got enrolled.
+            _ => Err(ProviderError::Device(
+                "more than one un-enrolled authenticator is connected. Leave just the \
+                 one you want to register plugged in."
+                    .into(),
+            )),
+        }
     }
-}
 
-impl Default for FidoInnerProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl InnerKeyProvider for FidoInnerProvider {
-    fn provision(&self) -> Result<Vec<u8>, ProviderError> {
-        let device = self.open()?;
+    /// Registers a credential on an authenticator that is not in `existing`.
+    /// Backs both `provision` (empty `existing`, at init) and
+    /// `provision_excluding` (enroll-key).
+    fn provision_on_new_device(&self, existing: &[Vec<u8>]) -> Result<Vec<u8>, ProviderError> {
+        let device = self.open_unenrolled(existing)?;
 
         // Named so an authenticator with a display shows something the user
         // recognizes when it prompts.
@@ -211,6 +303,51 @@ impl InnerKeyProvider for FidoInnerProvider {
         );
         Ok(credential_id)
     }
+}
+
+/// A connected authenticator, opened, plus its enumeration string for logs.
+struct OpenDevice {
+    info: String,
+    device: FidoKeyHid,
+}
+
+/// Asks `device`, silently, whether it holds any of `credential_ids`.
+///
+/// This is the standard CTAP2 pre-flight: an assertion with `up=false` and no
+/// user verification succeeds only on the authenticator that actually holds a
+/// listed credential; every other device answers `CTAP2_ERR_NO_CREDENTIALS`.
+/// No touch, no PIN, so probing several devices costs the user nothing.
+fn holds_any(device: &FidoKeyHid, credential_ids: &[Vec<u8>]) -> bool {
+    if credential_ids.is_empty() {
+        return false;
+    }
+    let mut builder = GetAssertionArgsBuilder::new(RP_ID, CHALLENGE)
+        .without_pin_and_uv()
+        .without_up();
+    for id in credential_ids {
+        builder = builder.add_credential_id(id);
+    }
+    device.get_assertion_with_args(&builder.build()).is_ok()
+}
+
+impl Default for FidoInnerProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InnerKeyProvider for FidoInnerProvider {
+    fn provision(&self) -> Result<Vec<u8>, ProviderError> {
+        // Init: no enrolled credentials exist yet, so nothing to exclude.
+        self.provision_on_new_device(&[])
+    }
+
+    fn provision_excluding(&self, existing: &[Vec<u8>]) -> Result<Vec<u8>, ProviderError> {
+        // Enroll-key: the registration must land on a key that is not one of
+        // the already-enrolled authenticators, which are typically still
+        // plugged in right next to the new one.
+        self.provision_on_new_device(existing)
+    }
 
     fn assert_secret(&self, credential_id: &[u8], salt: &[u8]) -> Result<SecureBuf, ProviderError> {
         // A single known credential is just an allow-list of one.
@@ -230,7 +367,10 @@ impl InnerKeyProvider for FidoInnerProvider {
             ));
         }
 
-        let device = self.open()?;
+        // Target the device that actually holds an enrolled credential, so a
+        // second connected key (say, one about to be enrolled) cannot swallow
+        // the PIN and the touch.
+        let device = self.open_enrolled(credential_ids)?;
 
         // PIN is required on every unlock. One request, one touch: every
         // enrolled credential goes in the allow-list and the authenticator

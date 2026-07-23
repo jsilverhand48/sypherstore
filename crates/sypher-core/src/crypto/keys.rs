@@ -234,17 +234,17 @@ pub trait InnerKeyProvider: Send + Sync {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
-    #[error("no device found: {0}")]
+    #[error("No device found: {0}")]
     NoDevice(String),
-    #[error("the vault is not provisioned on this machine")]
+    #[error("The vault is not provisioned on this machine")]
     NotProvisioned,
-    #[error("the operation timed out waiting for the user")]
+    #[error("The operation timed out waiting for the user")]
     Timeout,
-    #[error("the user cancelled the operation")]
+    #[error("The user cancelled the operation")]
     Cancelled,
-    #[error("device error: {0}")]
+    #[error("Device error: {0}")]
     Device(String),
-    #[error("stored key material is corrupt: {0}")]
+    #[error("Stored key material is corrupt: {0}")]
     Corrupt(String),
     #[error(transparent)]
     Key(#[from] KeyError),

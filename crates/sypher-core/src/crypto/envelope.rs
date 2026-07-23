@@ -69,27 +69,27 @@ pub const VERIFICATION_PLAINTEXT: &[u8] = b"sypherstore-verify";
 
 #[derive(Debug, thiserror::Error)]
 pub enum EnvelopeError {
-    #[error("not a sypherstore envelope (bad magic)")]
+    #[error("Not a sypherstore envelope (bad magic)")]
     BadMagic,
-    #[error("unsupported envelope version {0}, this build understands {VERSION}")]
+    #[error("Unsupported envelope version {0}, this build understands {VERSION}")]
     UnsupportedVersion(u8),
-    #[error("unsupported cipher id {0}")]
+    #[error("Unsupported cipher id {0}")]
     UnsupportedCipher(u8),
-    #[error("envelope is truncated: {0} bytes is too short")]
+    #[error("Envelope is truncated: {0} bytes is too short")]
     Truncated(usize),
-    #[error("envelope belongs to secret {found}, not {expected}")]
+    #[error("Envelope belongs to secret {found}, not {expected}")]
     IdMismatch { expected: Uuid, found: Uuid },
     /// Deliberately uninformative: distinguishing "wrong key" from "tampered
     /// ciphertext" would hand an attacker an oracle.
-    #[error("decryption failed: wrong key or corrupt data")]
+    #[error("Decryption failed: wrong key or corrupt data")]
     Decrypt,
-    #[error("payload encoding failed: {0}")]
+    #[error("Payload encoding failed: {0}")]
     Encode(String),
-    #[error("payload decoding failed: {0}")]
+    #[error("Payload decoding failed: {0}")]
     Decode(String),
     #[error(transparent)]
     Key(#[from] KeyError),
-    #[error("failed to gather randomness: {0}")]
+    #[error("Failed to gather randomness: {0}")]
     Random(#[from] getrandom::Error),
 }
 

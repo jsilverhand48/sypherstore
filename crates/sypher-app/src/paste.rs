@@ -16,6 +16,16 @@
 //! default, for the case where the portal is unavailable. It saves and
 //! restores the previous clipboard contents.
 //!
+//! ## Capitalization must not depend on the compositor
+//!
+//! Sending only a shifted keysym (say `A`) leaves it to the compositor to
+//! synthesize the Shift modifier. Native applications receive the resolved
+//! text either way, which hides the problem, but anything that re-encodes raw
+//! key events, a browser-based VNC client (noVNC, Guacamole/guacd) above all,
+//! sees a keycode with no Shift held and forwards lowercase. Uppercase ASCII
+//! letters are therefore typed with an explicit Left Shift press around the
+//! letter's tap; see [`needs_explicit_shift`] for why only those.
+//!
 //! ## Handling of the plaintext
 //!
 //! The secret arrives in a [`SecureBuf`] and is never copied into an ordinary
@@ -49,6 +59,15 @@ const FOCUS_RETURN_DELAY: Duration = Duration::from_millis(150);
 /// Some applications, notably Electron ones and browser password fields with
 /// JavaScript validation, drop characters delivered faster than this.
 const KEYSTROKE_DELAY: Duration = Duration::from_millis(8);
+
+/// Keysym for the left Shift key (`XK_Shift_L`).
+///
+/// Held explicitly around uppercase letters. Relying on the compositor to
+/// synthesize the modifier from a shifted keysym is exactly what breaks
+/// remote viewers: a browser-based VNC client (noVNC, Guacamole) rebuilds
+/// each keystroke from the raw browser key event, and if no real Shift press
+/// was delivered it forwards the lowercase keysym to the remote end.
+const KEYSYM_SHIFT_L: i32 = 0xFFE1;
 
 /// An established RemoteDesktop session that can type.
 ///
@@ -145,7 +164,11 @@ impl Typist {
                 tracing::warn!("skipping a character with no keysym mapping");
                 continue;
             };
-            self.tap(keysym).await?;
+            if needs_explicit_shift(ch) {
+                self.shifted_tap(keysym).await?;
+            } else {
+                self.tap(keysym).await?;
+            }
             typed += 1;
         }
 
@@ -157,17 +180,54 @@ impl Typist {
 
     /// Presses and releases one keysym.
     async fn tap(&self, keysym: i32) -> Result<()> {
-        self.portal
-            .notify_keyboard_keysym(&self.session, keysym, KeyState::Pressed, Default::default())
+        self.send(keysym, KeyState::Pressed)
             .await
             .context("sending a key press")?;
-        self.portal
-            .notify_keyboard_keysym(&self.session, keysym, KeyState::Released, Default::default())
+        self.send(keysym, KeyState::Released)
             .await
             .context("sending a key release")?;
         tokio::time::sleep(KEYSTROKE_DELAY).await;
         Ok(())
     }
+
+    /// Presses and releases one keysym while holding Left Shift, so the
+    /// modifier reaches every consumer as a real key event rather than being
+    /// left to the compositor's keysym resolution (see [`KEYSYM_SHIFT_L`]).
+    async fn shifted_tap(&self, keysym: i32) -> Result<()> {
+        self.send(KEYSYM_SHIFT_L, KeyState::Pressed)
+            .await
+            .context("pressing Shift")?;
+        let tapped = self.tap(keysym).await;
+        // Released even when the tap failed: a Shift left stuck down would
+        // garble everything typed afterwards, including by hand.
+        let released = self
+            .send(KEYSYM_SHIFT_L, KeyState::Released)
+            .await
+            .context("releasing Shift");
+        tapped?;
+        released
+    }
+
+    /// Sends a single keysym state change.
+    async fn send(&self, keysym: i32, state: KeyState) -> Result<()> {
+        self.portal
+            .notify_keyboard_keysym(&self.session, keysym, state, Default::default())
+            .await?;
+        Ok(())
+    }
+}
+
+/// Whether `ch` must be typed with Shift explicitly held.
+///
+/// Only ASCII uppercase: those are Shift+letter on effectively every layout.
+/// Shifted punctuation is layout dependent (`@` is AltGr+q on a German
+/// layout, not Shift+2), so wrapping it in Shift would mistype it; it stays
+/// on the compositor's keysym resolution, which handles it correctly. The
+/// same goes for non-ASCII capitals, which may live outside the layout
+/// entirely and be typed through a synthesized keycode where a held Shift
+/// would select the wrong level.
+fn needs_explicit_shift(ch: char) -> bool {
+    ch.is_ascii_uppercase()
 }
 
 /// Maps a character to an X11 keysym.
@@ -241,6 +301,34 @@ pub fn copy_via_clipboard(secret: &SecureBuf, clear_after: Duration) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uppercase_ascii_gets_an_explicit_shift() {
+        // A VNC viewer rebuilds keystrokes from raw key events, so the Shift
+        // must be a real press, not a compositor inference.
+        assert!(needs_explicit_shift('A'));
+        assert!(needs_explicit_shift('Z'));
+        assert!(!needs_explicit_shift('a'));
+        assert!(!needs_explicit_shift('0'));
+    }
+
+    #[test]
+    fn shifted_punctuation_is_left_to_the_compositor() {
+        // '@' is Shift+2 on a US layout but AltGr+q on a German one; a forced
+        // Shift would mistype it. The compositor resolves the keysym itself.
+        assert!(!needs_explicit_shift('@'));
+        assert!(!needs_explicit_shift('!'));
+        assert!(!needs_explicit_shift('~'));
+    }
+
+    #[test]
+    fn non_ascii_capitals_are_left_to_the_compositor() {
+        // These may not exist in the active layout at all and get typed via a
+        // synthesized keycode, where a held Shift would select the wrong
+        // level.
+        assert!(!needs_explicit_shift('É'));
+        assert!(!needs_explicit_shift('Ā'));
+    }
 
     #[test]
     fn ascii_maps_to_its_own_code_point() {

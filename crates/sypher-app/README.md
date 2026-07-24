@@ -15,7 +15,7 @@ YubiKey, DBus, a portal or a window is in this crate.
 | `daemon` | Wires the Wayland shell (main thread) to the async worker (background thread). |
 | `state` | The channel protocol between the two, and the shared lock state. |
 | `hotkey` | The GlobalShortcuts portal, spoken directly over zbus. See below. |
-| `paste` | Typing secrets via the RemoteDesktop portal; clipboard fallback. |
+| `paste` | Typing secrets via the RemoteDesktop portal; clipboard fallback. Uppercase ASCII is typed with an explicit Left Shift hold, because remote viewers (noVNC, Guacamole/guacd) re-encode raw key events and lose capitalization when the modifier is only inferred by the compositor. |
 | `ui/shell` | The `zwlr_layer_shell_v1` surface hosting the popup, on wgpu + egui. |
 | `ui/popup` | Popup state machine and drawing. Shell-agnostic. |
 | `ui/editor` | The add/edit form. |

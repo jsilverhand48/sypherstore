@@ -18,7 +18,7 @@ from ciphertext to plaintext; the rest of the crate is components it uses.
 | `vault::paths` | Vault location resolution and owner-only atomic writes. |
 | `vault::session` | Lock state machine, CRUD, and authenticator enrollment. Enforces "both keys or no plaintext". Enrollment passes the already-enrolled credential ids to `InnerKeyProvider::provision_excluding`, so a hardware provider can direct the new registration at a key that is not yet enrolled. |
 | `search::domain` | Hostname normalization and PSL-based domain matching. |
-| `search::fuzzy` | Ranking for the popup. Metadata only. |
+| `search::fuzzy` | Ranking for the popup. Metadata only. Default order is alphabetical by name (case-insensitive); a query ranks by fuzzy match quality and a matching site by domain relevance, with name as the tiebreak. |
 | `config` | Non-secret JSON configuration. |
 | `mock_hw` | File-backed fake providers, behind the `mock-hw` feature. **No security.** |
 

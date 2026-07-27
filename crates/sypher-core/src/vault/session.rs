@@ -395,8 +395,10 @@ impl Session {
             metas.push(meta);
         }
         // The sort key lives inside the sealed blob, so ordering happens here
-        // rather than in SQL.
-        metas.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        // rather than in SQL. Default order is alphabetical by name
+        // (case-insensitive); this is the baseline the searcher re-ranks for a
+        // query or a matching site.
+        metas.sort_by_key(|m| m.name.to_lowercase());
         Ok(metas)
     }
 

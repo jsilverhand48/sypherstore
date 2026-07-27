@@ -27,11 +27,16 @@
 //! has no title bar to drag, because reaching for the mouse costs more time
 //! than typing the site name.
 //!
-//! The clickable affordances (the **+ Add** button, each row's **x**, and
-//! **Save**/**Cancel** in the editor) exist anyway, for two reasons: they
-//! advertise what is possible to someone who has not memorised the chords, and
-//! a destructive or committing action is worth making explicit rather than
-//! leaving it to a chord that has to be known in advance.
+//! The clickable affordances (the **+ Add** button, each row's **pencil** and
+//! **x**, and **Save**/**Cancel** in the editor) exist anyway, for two reasons:
+//! they advertise what is possible to someone who has not memorised the chords,
+//! and a destructive or committing action is worth making explicit rather than
+//! leaving it to a chord that has to be known in advance. The row's pencil is
+//! the mouse equivalent of Ctrl+E; like the chord it asks the worker to decrypt
+//! the secret with the already-unlocked session rather than opening the form
+//! locally (the popup never holds plaintext until the worker returns it).
+//! Inside that form an **eye** toggle next to the Secret field reveals the
+//! stored value in plain text.
 //!
 //! `Ctrl+V` pastes the clipboard into whichever field has focus. egui has no
 //! clipboard of its own, so the shell reads the selection and injects it; see
@@ -313,7 +318,7 @@ impl Popup {
         }
         if keys.ctrl && keys.e {
             // Editing needs the plaintext, which only the worker can produce
-            // and only after a fresh assertion.
+            // (from the already-unlocked session).
             if let Some(target) = self.ranked.get(self.selected).map(|r| r.meta.id) {
                 let _ = self.requests.send(UiRequest::BeginEdit(target));
             }
@@ -492,6 +497,7 @@ impl Popup {
 
         let usable = self.lock_state.is_unlocked();
         let mut clicked: Option<usize> = None;
+        let mut edit_requested: Option<usize> = None;
         let mut delete_requested: Option<usize> = None;
         // Consume the scroll request: the list follows the selection only on
         // the frame the keyboard moved it, never every frame, or the mouse
@@ -506,6 +512,9 @@ impl Popup {
                     let row = draw_row(ui, entry, selected, usable);
                     if row.activated {
                         clicked = Some(i);
+                    }
+                    if row.edited {
+                        edit_requested = Some(i);
                     }
                     if row.deleted {
                         delete_requested = Some(i);
@@ -525,6 +534,17 @@ impl Popup {
             if let Some(entry) = self.ranked.get(i) {
                 self.selected = i;
                 self.mode = Mode::ConfirmDelete(entry.meta.id, entry.meta.name.clone());
+            }
+            return;
+        }
+        // The pencil likewise pre-empts activation. Editing needs the
+        // plaintext, which only the worker can produce from the unlocked
+        // session, so this mirrors the Ctrl+E path rather than opening the
+        // form locally.
+        if let Some(i) = edit_requested {
+            if let Some(id) = self.ranked.get(i).map(|r| r.meta.id) {
+                self.selected = i;
+                let _ = self.requests.send(UiRequest::BeginEdit(id));
             }
             return;
         }
@@ -700,8 +720,43 @@ impl Popup {
                         ui.end_row();
 
                         // The one field rendered as a password: everything
-                        // else here is already stored in the clear.
-                        text_row(ui, "Secret", &mut editor.value, Field::Value, editor.focus, &mut editor.focus_dirty, true);
+                        // else here is already stored in the clear. The eye
+                        // button beside it toggles masking via Editor::reveal,
+                        // which lets the user view the stored secret in plain
+                        // text without leaving the form.
+                        ui.label("Secret");
+                        ui.horizontal(|ui| {
+                            let response = ui.add(
+                                egui::TextEdit::singleline(&mut editor.value)
+                                    .password(!editor.reveal)
+                                    .desired_width(392.0),
+                            );
+                            if editor.focus_dirty && Field::Value == editor.focus {
+                                response.request_focus();
+                                editor.focus_dirty = false;
+                            }
+                            // Same glyph both ways; the tint and hover text
+                            // carry the state, since the bundled fonts have no
+                            // eye-with-slash counterpart.
+                            let hint = if editor.reveal { "Hide secret" } else { "Show secret" };
+                            let color = if editor.reveal {
+                                egui::Color32::from_rgb(0xE5, 0xC0, 0x7B)
+                            } else {
+                                ui.visuals().weak_text_color()
+                            };
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("\u{1F441}").size(16.0).color(color),
+                                    )
+                                    .frame(false),
+                                )
+                                .on_hover_text(hint)
+                                .clicked()
+                            {
+                                editor.reveal = !editor.reveal;
+                            }
+                        });
                         ui.end_row();
 
                         ui.label("Type");
@@ -848,11 +903,13 @@ struct RowAction {
     response: egui::Response,
     /// The row body was clicked: use the secret.
     activated: bool,
+    /// The pencil was clicked: begin editing.
+    edited: bool,
     /// The x was clicked: begin deletion.
     deleted: bool,
 }
 
-/// Draws one secret row with its delete affordance.
+/// Draws one secret row with its edit and delete affordances.
 fn draw_row(ui: &mut egui::Ui, entry: &Ranked, selected: bool, usable: bool) -> RowAction {
     let meta = &entry.meta;
     let row_height = 44.0;
@@ -877,13 +934,14 @@ fn draw_row(ui: &mut egui::Ui, entry: &Ranked, selected: bool, usable: bool) -> 
         ui.visuals().weak_text_color()
     };
 
-    // The delete button occupies the right edge, so the body is inset to
-    // avoid it. Without this the row's click area would sit under the x and
-    // swallow the click.
+    // The edit (pencil) and delete (x) buttons occupy the right edge, so the
+    // body is inset to avoid both. Without this the row's click area would sit
+    // under them and swallow the click.
+    let edit_width = 28.0;
     let delete_width = 28.0;
     let body_rect = egui::Rect::from_min_max(
         rect.min + egui::vec2(8.0, 4.0),
-        egui::pos2(rect.max.x - delete_width, rect.max.y - 4.0),
+        egui::pos2(rect.max.x - edit_width - delete_width, rect.max.y - 4.0),
     );
 
     let delete_rect = egui::Rect::from_min_max(
@@ -902,6 +960,27 @@ fn draw_row(ui: &mut egui::Ui, entry: &Ranked, selected: bool, usable: bool) -> 
                 .frame(false),
             )
             .on_hover_text("Delete this secret")
+            .clicked()
+        })
+        .inner;
+
+    // The pencil sits just left of the x, in its own column.
+    let edit_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.max.x - edit_width - delete_width, rect.min.y),
+        egui::pos2(rect.max.x - delete_width, rect.max.y),
+    );
+    let mut edit_ui = ui.new_child(egui::UiBuilder::new().max_rect(edit_rect));
+    let edited = edit_ui
+        .centered_and_justified(|ui| {
+            ui.add(
+                egui::Button::new(
+                    egui::RichText::new("\u{270F}")
+                        .size(16.0)
+                        .color(egui::Color32::from_rgb(0x61, 0xAF, 0xEF)),
+                )
+                .frame(false),
+            )
+            .on_hover_text("Edit this secret")
             .clicked()
         })
         .inner;
@@ -937,7 +1016,8 @@ fn draw_row(ui: &mut egui::Ui, entry: &Ranked, selected: bool, usable: bool) -> 
     });
 
     RowAction {
-        activated: response.clicked() && !deleted,
+        activated: response.clicked() && !deleted && !edited,
+        edited,
         deleted,
         response,
     }
@@ -1016,6 +1096,17 @@ mod tests {
         let (mut p, _rx) = popup();
         p.rerank();
         assert_eq!(p.ranked.len(), 3);
+    }
+
+    #[test]
+    fn the_resting_list_is_alphabetical_by_name() {
+        // No query and no host: rows come back in case-insensitive A->Z order
+        // regardless of how they were stored.
+        let (mut p, _rx) = popup();
+        p.secrets = vec![meta("Zulip", ""), meta("apple", ""), meta("Bravo", "")];
+        p.rerank();
+        let names: Vec<_> = p.ranked.iter().map(|r| r.meta.name.as_str()).collect();
+        assert_eq!(names, ["apple", "Bravo", "Zulip"]);
     }
 
     #[test]
@@ -1109,6 +1200,34 @@ mod tests {
         match &p.mode {
             Mode::Edit(e) => assert!(e.is_new()),
             _ => panic!("expected the editor to open"),
+        }
+    }
+
+    #[test]
+    fn edit_ready_opens_a_populated_masked_editor() {
+        // This is what a pencil click (or Ctrl+E) ultimately produces: the
+        // worker returns the decrypted secret and the form opens pre-filled,
+        // in edit mode, with the value masked until the eye is used.
+        use sypher_core::model::SecretPayload;
+        use sypher_core::secure::SecureBuf;
+
+        let (mut p, _rx) = popup();
+        let mut m = meta("GitHub", "github.com");
+        m.username = "octocat".into();
+        let payload = SecretPayload::new(SecureBuf::copy_from(b"hunter2"));
+
+        p.handle_event(DaemonEvent::EditReady { meta: m.clone(), payload });
+
+        match &p.mode {
+            Mode::Edit(e) => {
+                assert!(!e.is_new(), "must be an edit, not a new secret");
+                assert_eq!(e.id, Some(m.id));
+                assert_eq!(e.name, "GitHub");
+                assert_eq!(e.username, "octocat");
+                assert_eq!(e.value, "hunter2");
+                assert!(!e.reveal, "the secret must open masked");
+            }
+            _ => panic!("EditReady must open the editor"),
         }
     }
 

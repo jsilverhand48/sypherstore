@@ -76,8 +76,9 @@ pub enum UiRequest {
     Dismissed,
     /// Extend the unlock window because the user is actively interacting.
     Touch,
-    /// Decrypt a secret so it can be edited. Always forces a fresh assertion
-    /// when `confirm_on_edit` is set, even if the vault is already unlocked.
+    /// Decrypt a secret so it can be edited, reusing the current unlocked
+    /// session. No fresh touch or PIN is asked while unlocked; a relocked
+    /// vault is unlocked normally first.
     BeginEdit(Uuid),
     /// Store a new secret, or replace an existing one when `meta.id` matches
     /// a stored secret and `is_update` is set.

@@ -72,6 +72,10 @@ pub struct Editor {
     /// Comma-separated; split on save.
     pub tags: String,
     pub notes: String,
+    /// Whether the secret field is shown in the clear rather than masked.
+    /// Toggled by the eye button next to it and always starts `false`, so a
+    /// secret opens masked; this is a render-only flag and is not persisted.
+    pub reveal: bool,
     /// Preserved so an edit does not reset the creation date.
     created_at: i64,
     pub focus: Field,
@@ -93,6 +97,7 @@ impl Editor {
             application: String::new(),
             tags: String::new(),
             notes: String::new(),
+            reveal: false,
             created_at: sypher_core::model::now_unix(),
             focus: Field::Name,
             focus_dirty: true,
@@ -124,6 +129,7 @@ impl Editor {
                 .and_then(|n| n.as_str().ok())
                 .unwrap_or_default()
                 .to_string(),
+            reveal: false,
             created_at: meta.created_at,
             focus: Field::Name,
             focus_dirty: true,
@@ -313,6 +319,20 @@ mod tests {
         assert_eq!(e.value, "s3cr3t");
         assert_eq!(e.notes, "a note");
         assert!(!e.is_new());
+    }
+
+    #[test]
+    fn the_secret_starts_masked_whether_adding_or_editing() {
+        // The eye toggle reveals on demand; a form must never open already
+        // showing the plaintext.
+        assert!(!Editor::new().reveal, "a new secret must open masked");
+
+        let meta = SecretMeta::new("Thing", SecretType::Password);
+        let payload = SecretPayload::new(SecureBuf::copy_from(b"s3cr3t"));
+        assert!(
+            !Editor::from_existing(&meta, &payload).reveal,
+            "an edited secret must open masked"
+        );
     }
 
     #[test]

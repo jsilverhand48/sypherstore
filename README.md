@@ -43,7 +43,8 @@ With a `mock-hw` build and the daemon running:
   you can fuzzy-search across name, site, username and tags; arrow keys move
   the selection; **Enter** decrypts the secret and types it into whatever had
   focus before the popup opened.
-- **Ctrl+N** adds, **Ctrl+E** edits (demanding a fresh touch first),
+- **Ctrl+N** adds, **Ctrl+E** (or the row's pencil) edits the selected secret
+  using the key already in hand, so it opens straight into the editor,
   **Ctrl+D** deletes with a confirmation. **Esc** backs out of anything.
 - **+ Add** in the header, or Ctrl+N, opens the editor; **Save** or Ctrl+S
   commits it. **Ctrl+V** pastes into the focused field. The editor stays open

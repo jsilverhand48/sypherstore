@@ -406,15 +406,15 @@ async fn on_request(
         }
 
         UiRequest::BeginEdit(id) => {
-            // Revealing an existing secret in an editable field is a stronger
-            // action than pasting one: the plaintext goes on screen and sits
-            // there. When `confirm_on_edit` is set we demand a fresh touch
-            // even if the vault is already unlocked, so an unlocked session
-            // left unattended cannot be used to read secrets back out.
-            if config.confirm_on_edit {
-                shared.with_session(|s| s.lock());
+            // Editing decrypts the secret into the form using the key that is
+            // already in hand. Opening the list required an unlock, so in the
+            // normal case this asks for neither a touch nor a PIN and goes
+            // straight to the edit screen. Only if the vault has since relocked
+            // on the idle timeout do we fall back to a normal unlock, exactly
+            // as saving does.
+            if !shared.ui_lock_state().is_unlocked() {
                 if let Err(e) = reassert(shared, paths, pin_broker).await {
-                    tracing::warn!(error = %e, "re-assertion for edit failed");
+                    tracing::warn!(error = %e, "unlock for edit failed");
                     ui.error(format!("{e}"));
                     return;
                 }

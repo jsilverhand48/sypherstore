@@ -17,8 +17,8 @@ YubiKey, DBus, a portal or a window is in this crate.
 | `hotkey` | The GlobalShortcuts portal, spoken directly over zbus. See below. |
 | `paste` | Typing secrets via the RemoteDesktop portal; clipboard fallback. Uppercase ASCII is typed with an explicit Left Shift hold, because remote viewers (noVNC, Guacamole/guacd) re-encode raw key events and lose capitalization when the modifier is only inferred by the compositor. |
 | `ui/shell` | The `zwlr_layer_shell_v1` surface hosting the popup, on wgpu + egui. |
-| `ui/popup` | Popup state machine and drawing. Shell-agnostic. |
-| `ui/editor` | The add/edit form. |
+| `ui/popup` | Popup state machine and drawing. Shell-agnostic. Rows are listed alphabetically by name and carry a pencil (edit) and an x (delete) button; the pencil triggers the same worker-side decrypt as Ctrl+E. |
+| `ui/editor` | The add/edit form, also used to view a secret: the Secret field has an eye toggle that reveals the stored value in plain text (masked by default). |
 | `browser/kwin` | Active-window tracking via a KWin script and a D-Bus service. |
 | `browser/url` | Focused-tab URL extraction over AT-SPI2. Best effort. |
 | `pin` | Bridges the synchronous CTAP PIN callback to the asynchronous popup. |

@@ -61,11 +61,17 @@ pub struct Config {
     /// wait, since a slow filter is worse than no filter.
     pub browser_detect_timeout_ms: u64,
 
-    /// Require a fresh touch to reveal or edit a secret even while unlocked.
-    pub confirm_on_edit: bool,
-
     /// Keep this many scheduled backups before pruning the oldest.
     pub backup_retention: usize,
+
+    /// Retired: editing a secret no longer re-authenticates, so this does
+    /// nothing. It is still accepted when reading a config written by an
+    /// older build, because `deny_unknown_fields` would otherwise reject the
+    /// whole file. `skip_serializing` means it is dropped the next time the
+    /// config is written, so the key disappears on its own.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
+    confirm_on_edit: bool,
 }
 
 impl Default for Config {
@@ -78,8 +84,8 @@ impl Default for Config {
             clipboard_clear_ms: 100,
             browser_detection: true,
             browser_detect_timeout_ms: 300,
-            confirm_on_edit: true,
             backup_retention: 10,
+            confirm_on_edit: false,
         }
     }
 }
@@ -180,6 +186,31 @@ mod tests {
         Config::default().save(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn a_config_with_the_retired_confirm_on_edit_key_still_loads() {
+        // Configs written before edit re-authentication was removed carry this
+        // key. deny_unknown_fields would otherwise reject the whole file and
+        // stop the daemon from starting, so it must be accepted and ignored.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(
+            &path,
+            br#"{"hotkey":"Meta+Shift+V","confirm_on_edit":true}"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.hotkey, "Meta+Shift+V");
+
+        // Re-saving drops the retired key so it disappears over time.
+        cfg.save(&path).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !written.contains("confirm_on_edit"),
+            "the retired key must not be written back out"
+        );
     }
 
     #[test]

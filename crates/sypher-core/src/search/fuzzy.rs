@@ -21,18 +21,20 @@ use nucleo_matcher::{Config, Matcher};
 use crate::model::SecretMeta;
 use crate::search::domain::{match_domain, DomainMatch};
 
-/// A secret's ranking for one query, in comparison order.
+/// A secret's ranking for one query.
 ///
-/// Derived `Ord` compares fields top to bottom, which encodes the priority:
-/// domain relevance, then fuzzy quality, then recency as a stable tiebreak.
+/// The fields encode the priority: domain relevance first, then fuzzy quality.
+/// The final ordering is applied in [`Searcher::rank`], which breaks ties by
+/// secret name (ascending, case-insensitive) so the resting order of the list
+/// is alphabetical, falling back to recency only when names are equal. `recency`
+/// is kept for that last tiebreak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Score {
     /// How well the secret matches the active browser's host.
     pub domain: DomainMatch,
     /// Fuzzy match quality against the typed query. Zero when no query.
     pub fuzzy: u32,
-    /// Last-updated timestamp, so equally relevant entries surface the one
-    /// most recently used.
+    /// Last-updated timestamp, used only to break ties between identical names.
     pub recency: i64,
 }
 
@@ -137,8 +139,18 @@ impl Searcher {
             out.retain(|r| r.score.domain.is_match());
         }
 
-        // Descending: highest score first.
-        out.sort_by(|a, b| b.score.cmp(&a.score));
+        // Domain and fuzzy quality descending (highest first), then name
+        // ascending so that with no query and no host match, where those are
+        // equal for every entry, the list is plain alphabetical. Recency is the
+        // last resort, only when two secrets share a name.
+        out.sort_by(|a, b| {
+            b.score
+                .domain
+                .cmp(&a.score.domain)
+                .then(b.score.fuzzy.cmp(&a.score.fuzzy))
+                .then_with(|| a.meta.name.to_lowercase().cmp(&b.meta.name.to_lowercase()))
+                .then(b.score.recency.cmp(&a.score.recency))
+        });
         out
     }
 
@@ -212,6 +224,20 @@ mod tests {
         let mut s = Searcher::new();
         let out = s.rank(&corpus(), "", &SearchContext::default());
         assert_eq!(out.len(), 5);
+    }
+
+    #[test]
+    fn the_default_order_is_alphabetical_by_name() {
+        // With no query and no host, nothing distinguishes the entries but
+        // their names, so the resting order is a plain case-insensitive A->Z.
+        // ("AWS" sorts before "GitHub" only if the compare is case-insensitive,
+        // and "Google Cloud" before "Google Mail" checks the full-name tiebreak.)
+        let mut s = Searcher::new();
+        let out = s.rank(&corpus(), "", &SearchContext::default());
+        assert_eq!(
+            names(&out),
+            vec!["AWS Console", "GitHub", "GitLab", "Google Cloud", "Google Mail"],
+        );
     }
 
     #[test]
